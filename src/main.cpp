@@ -1,10 +1,12 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include "format/video_format.h"
 #include "io/raw_reader.h"
 #include "io/tbc_writer.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/async_orchestrator.h"
 
 static void usage(const char* prog) {
     fprintf(stderr, "Usage: %s [options] <input.raw> <output_base>\n", prog);
@@ -94,17 +96,35 @@ int main(int argc, char* argv[]) {
                 input_path.c_str(), input_format_name(input_fmt), duration, total);
     }
 
-    // Open output
-    TBCWriter writer;
-    if (!writer.open(output_base, fmt, overwrite)) {
-        return 1;
-    }
+    // Choose orchestration mode:
+    //   - Async (parallel): seekable file + threads != 1
+    //   - Sequential: stdin/pipe or --threads 1
+    bool use_async = reader.is_seekable() && num_threads != 1;
 
-    // Run pipeline
-    Pipeline pipeline;
-    if (!pipeline.run(reader, writer, fmt, num_threads)) {
-        fprintf(stderr, "Pipeline failed\n");
-        return 1;
+    if (use_async) {
+        if (num_threads <= 0) {
+            num_threads = std::max(1, (int)std::thread::hardware_concurrency() - 1);
+        }
+        fprintf(stderr, "Mode: async parallel (%d threads)\n", num_threads);
+
+        AsyncOrchestrator orchestrator;
+        if (!orchestrator.run(reader, output_base, fmt, num_threads, overwrite)) {
+            fprintf(stderr, "Async pipeline failed\n");
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "Mode: sequential\n");
+
+        TBCWriter writer;
+        if (!writer.open(output_base, fmt, overwrite)) {
+            return 1;
+        }
+
+        Pipeline pipeline;
+        if (!pipeline.run(reader, writer, fmt, num_threads)) {
+            fprintf(stderr, "Pipeline failed\n");
+            return 1;
+        }
     }
 
     return 0;

@@ -16,6 +16,7 @@ add_executable(vhspp
     src/format/video_format.cpp
     src/io/raw_reader.cpp
     src/io/tbc_writer.cpp
+    src/io/tbc_pwriter.cpp
     src/pipeline/fm_demod.cpp
     src/pipeline/sync_pulses.cpp
     src/pipeline/line_locs.cpp
@@ -25,6 +26,9 @@ add_executable(vhspp
     src/pipeline/chroma_decode.cpp
     src/pipeline/dropout_detect.cpp
     src/pipeline/pipeline.cpp
+    src/pipeline/chunk_worker.cpp
+    src/pipeline/async_orchestrator.cpp
+    src/util/cache_info.cpp
 )
 
 target_include_directories(vhspp PRIVATE src ${FFTW3_INCLUDE_DIR})

@@ -18,40 +18,141 @@ PCIe transfer amortization. None of these apply on CPU. Copying that architectur
 would mean synchronization barriers at every kernel stage and a serial prescan
 pass — both unnecessary costs on CPU.
 
-### Parallelization: B+overlap with supervisor/worker model
+### Parallelization: chunkd overlap with supervisor/worker model
 
 Based on discussion with namazso (vhs-decode developer): the only true cross-field
 dependency in sync finding is the flywheel fallback when syncs are too degraded
-to find independently. Good syncs are self-describing.
+to find independently. Good syncs are self-describing. namazso independently
+arrived at the same chunkd overlap approach for vhs-decode-lite (Python),
+confirming this is the right architecture for CPU decoders.
 
-**Worker threads** (N = core count):
-- Each owns a chunk of the input file (with overlap regions at boundaries)
+**Core concept**: Divide input into overlapping chunks (chunks). Each worker
+processes its chunk independently — full K1–K7 pipeline, including VSYNC
+discovery via the drift-corrected loop. Supervisor assigns chunks, stitches
+output at boundaries, and handles tape edit cleanup.
+
+**Two modes, one architecture**: Async (file) and live (streaming) use the same
+worker code, same stitching logic, same cleanup mechanism. The only difference
+is chunk sizing:
+
+#### Async mode (file decode)
+
+Goal: maximum throughput.
+
+```
+File:     [========================================================]
+Chunks:  [====S1====][====S2====][====S3====][====S4====][====S5====]
+                  ↕overlap    ↕overlap    ↕overlap    ↕overlap
+Workers:  W1:S1      W2:S2      W3:S3      W4:S4      W5:S5  ...
+          (all run in parallel)
+Output:   [=F1=][=F2=][=F3=][=F4=][=F5=] → stitch → final TBC
+```
+
+- Divide file into N large chunks (file_size / num_workers), with overlap
+  regions (~30 fields / ~0.5s) at boundaries
+- All workers launch simultaneously, process chunks in parallel
+- Each worker runs the drift-corrected sequential loop on its chunk
+- Workers write TBC fields via `pwrite()` at computed byte offsets
+- Supervisor stitches at boundaries when workers complete
+- Tape edit cleanup pass runs after all workers finish (see below)
+- Chunk size: large (total_size / num_workers). Minimizes overlap waste.
+
+#### Live mode (streaming during capture)
+
+Goal: low latency with full fidelity.
+
+```
+Capture:  ████████████████████████████████████████████►
+Chunks:       [S1][S2][S3][S4][S5][S6][S7]...
+                ↕ov ↕ov ↕ov ↕ov ↕ov ↕ov
+Workers:       W1  W2  W3  W1  W4  W2  ...
+               (assigned as chunks fill)
+Output:          ██  ██  ██  ██  ██  ██ ...
+                 ↑
+            first output at ~5-10s
+```
+
+- Small chunks (~2-5 seconds) assigned to workers as capture data fills
+- Same worker code, same stitching — just smaller pieces
+- Latency = chunk_capture_time + one_chunk_processing_time ≈ 5-10 seconds
+- Overlap waste is high but irrelevant: compute budget vastly exceeds capture
+  rate (e.g., 6 cores × 13 fps = 78 fps vs 30 fps capture)
+- Tape edit handling: buffer + deferred cleanup (see below)
+
+#### Workers
+
+**Worker threads** (N = detected core count, platform-adaptive):
+- Each owns a chunk of the input (with overlap at boundaries)
 - Runs the full K1–K7 pipeline independently, field by field
+- Uses VSYNC drift-corrected advancement (proportional feedback loop)
 - Owns its own FFTW plans and scratch buffers — zero sharing, zero locking
-- Writes TBC output via `pwrite()` at computed byte offsets as fields complete
+- Reports: first/last valid VSYNC positions, field count, chroma state at
+  chunk boundaries
 
-**Supervisor thread**:
-- Assigns chunks to workers
-- Monitors overlap regions: workers report sync positions for overlap fields
-- Resolves stitch points: matching VSYNCs found independently by adjacent chunks
-- Flywheel fallback: re-processes boundary serially if no sync match found
-- Writes JSON metadata (globally ordered)
-- Enforces field parity across chunk boundaries
+**Core count detection**: Platform-dependent syscalls required.
+- Linux: `sysconf(_SC_NPROCESSORS_ONLN)` or `std::thread::hardware_concurrency()`
+- macOS: `sysctl hw.ncpu`
+- Windows: `GetSystemInfo()` → `dwNumberOfProcessors`
+- Fallback: `std::thread::hardware_concurrency()` (portable but not always
+  accurate). Reserve 1 core for supervisor. Minimum 6 cores recommended.
+
+#### Supervisor
+
+- Assigns chunks to workers (upfront for async, on-demand for live)
+- Stitches output at chunk boundaries: match VSYNCs in overlap within ±500
+  samples. Both workers produce fields for the overlap; supervisor picks a
+  cut point and discards duplicates.
+- Writes globally-ordered JSON metadata
+- Enforces field parity across boundaries
 - Reports progress
+- Manages tape edit cleanup (see below)
 
-**Overlap size**: ~30 fields (~0.5 seconds). Provides:
+#### Tape edit handling
+
+Tape edits at chunk boundaries are not rare enough to ignore. On a 2-hour tape
+with 30s chunks, ~240 boundaries. With ~5 edits per tape, probability of at
+least one boundary landing on an edit is significant. Edits can be 50ms to 4s.
+
+**Requirements**: Must preserve timing (audio sync). Must decode the edit region
+(fidelity — never replace real signal with blanks). Small cleanup cost acceptable.
+
+**Async mode**: Cleanup pass runs after all workers complete.
+1. Worker A reports last valid field position before the edit
+2. Worker B reports first valid field position after the edit
+3. Supervisor identifies the gap
+4. One worker re-decodes just that region serially, using worker A's last known
+   chroma state as initial conditions
+5. Cleanup output fills the gap in the final TBC
+6. Cost: ~1 second wall time per edit boundary. Negligible.
+
+**Live mode**: Same cleanup, triggered inline.
+1. Failed stitch detected → buffer output for that region, don't emit yet
+2. Keep processing subsequent chunks normally with remaining workers
+3. When stitching succeeds again (far side of edit): extent of edit is known
+4. One worker enters "penalty box" — runs cleanup pass on the buffered region
+5. Cleaned-up output emitted, worker rejoins live pool
+6. Latency penalty only during/after the edit. Normal playback unaffected.
+7. At 6+ cores, losing one worker temporarily is fine:
+   5 workers × 13 fps = 65 fps, still 2× capture rate.
+8. Degenerate case (tape that's mostly edits): detect when too many workers
+   are in cleanup simultaneously → warn user, suggest async mode.
+
+#### Overlap sizing
+
+~30 fields (~0.5 seconds) per chunk boundary. Provides:
+- VSYNC matching context for stitching
 - Lineloc coherence window (±10 fields)
 - Chroma track auto-detection context
 - NTSC 8-field phase cycle
 - Enough clean signal for sync matching even near tape edit points
 
-**Stitching**: Both chunks independently find VSYNC positions in the overlap.
-A match = same VSYNC within ±500 samples. Supervisor decides: chunk A owns
-fields up to match, chunk B owns everything after.
+#### Chunk sizing tradeoffs
 
-**Fallback**: If no matching syncs in overlap (tape edit on chunk boundary),
-supervisor re-processes the boundary region serially using the previous chunk's
-last known good state. Expected to be rare.
+| Chunk size | Overlap waste | Latency  | Use case        |
+|-------------|---------------|----------|-----------------|
+| Large (30s+)| ~1-2%         | N/A      | Async file mode |
+| Medium (5s) | ~10%          | ~8-10s   | Live monitoring |
+| Small (2s)  | ~25%          | ~4-5s    | Live preview    |
 
 ### Design constraint: orchestrator-agnostic pipeline stages
 
@@ -61,25 +162,19 @@ chunk boundaries, field ordering, or scheduling strategy.
 
 State structs (FMDemodState, ChromaState, etc.) are owned and carried by the
 caller — not global, not singleton. This keeps the door open for alternative
-orchestration strategies without touching DSP code:
-
-- **B+overlap** (file mode): supervisor divides file into overlapping chunks,
-  workers process chunks independently
-- **C / work queue** (live/streaming mode): fields arrive continuously,
-  workers pull from shared queue, sequential field ordering
-- **Single-threaded** (simple/debug mode): one loop calling stages in order
+orchestration strategies without touching DSP code.
 
 The orchestrator is the only component that knows the strategy. Stages don't.
 
 ### Why this is better than GPU-style batching on CPU
 
-| Aspect                | GPU batching (cuVHS) | B+overlap (VHSpp) |
-|-----------------------|---------------------|--------------------|
-| Serial prescan        | Required (12-53s)   | Eliminated         |
-| Cross-kernel barriers | Every stage          | None               |
+| Aspect                | GPU batching (cuVHS) | Chunkd overlap (VHSpp) |
+|-----------------------|---------------------|--------------------------|
+| Serial prescan        | Required (12-53s)   | Eliminated               |
+| Cross-kernel barriers | Every stage          | None                     |
 | Cache behavior        | Bad (field data evicted between stages) | Good (one field stays hot through K1-K7) |
-| Worker independence   | All share batch state | Fully independent  |
-| Complexity            | Simpler              | Medium             |
+| Worker independence   | All share batch state | Fully independent       |
+| Live mode             | Not possible         | Same architecture, small chunks |
 
 ### Memory management
 
@@ -92,7 +187,7 @@ file size.
 
 **FFTW plans**: Created once per worker at init. `fftw_execute_dft_r2c(plan,
 different_in, different_out)` is thread-safe per FFTW docs. Plan creation is
-NOT thread-safe, so each worker creates its own plans.
+NOT thread-safe, so each worker creates its own plans serially at startup.
 
 **Cache locality**: Processing one field end-to-end (K1→K7) keeps its ~3.6 MB
 of data hot in L2/L3. This is the primary performance advantage of per-field
@@ -313,3 +408,128 @@ cuVHS plans to fix this by demodding first in large GPU chunks, then finding
 actual VSYNC in the clean baseband signal — which is exactly what VHSpp already
 does. Our post-demod field detection (sync_pulses + line_locs on demod05) is
 immune to this issue by design.
+
+### Async orchestrator and parallel performance (2026-03-27)
+
+Built the parallel file-mode pipeline:
+- **TBCPWriter**: pwrite()-based TBC writer allowing concurrent field output at
+  computed byte offsets. Pre-allocates files, supports compaction after stitching.
+- **ChunkWorker**: Per-chunk function running full K1–K7 pipeline. Thread-local
+  pread() for input. VSYNC-locked advancement. Per-stage profiling (worker 0 only).
+- **AsyncOrchestrator**: Divides file into N overlapping chunks, launches workers
+  in parallel, monitors progress (atomic counter + 500ms poll), stitches at
+  boundaries, compacts output.
+
+**Stitching**: Match absolute VSYNC positions (file_offset + lineloc0) within
+±500 sample tolerance. Count ALL consecutive matches at each boundary (not just
+the first) to correctly trim duplicate fields. Verified: exact field count match
+across all thread counts (1, 4, 8, 12, 23).
+
+**Performance on i9-12900K (8P+8E, 30MB L3)**:
+- Sequential: 13 fps (single-threaded pipeline)
+- Async 23 threads, full-field FFT: ~35 fps (2.7× speedup, memory-bandwidth limited)
+- Async 23 threads, tiled FFT (15K tiles): ~110 fps (8.5× speedup, but visual artifacts — see tiling section)
+- Profile: FM demod = 52%, chroma decode = 40% of processing time
+
+### Tiled FM demod: attempted, investigated, abandoned (2026-03-27)
+
+**Problem**: 23 workers × 960K-point FFT = ~46 MB working set per worker.
+Total ~1 GB vs 30 MB L3 cache. perf stat showed IPC=0.49, ~80% cache miss rate.
+
+**Attempted fix**: Overlap-save tiled FM demod. Cache-adaptive tile sizing from
+/sys/devices/system/cpu/cpu0/cache/ (L2/L3 query). Tile size ~15360 (7-smooth),
+overlap = 4096 samples. At 80% L2 budget: 1280K L2/core × 0.80 / 68 bytes per
+sample ≈ 15K tile. This gave ~85 tiles per 2×spf buffer.
+
+**Performance**: Tiling genuinely helped. Full-field async = ~35 fps. Tiled
+async = 110+ fps. The cache-friendly tiles eliminated the L3 thrashing.
+(Previous logbook entry incorrectly claimed 110fps without tiling — that was
+never tested; the 110fps was always from the tiled path.)
+
+**Visual artifacts**: White "comet" streaks (short bright horizontal streaks
+like shooting stars) and mild tearing, appearing ONLY with the tiled path.
+Full-field output was clean.
+
+**Attempted fixes** (both failed — comets persisted):
+
+1. **demod_raw buffer separation**: Pass 1 writes atan2 angles + phase unwrap
+   to a separate demod_raw[] buffer. Pass 2 reads from demod_raw[] exclusively
+   to prevent in-place corruption where one tile's filtered output contaminates
+   the next tile's overlap input. Comets persisted.
+
+2. **Sequential phase unwrap**: Moved phase unwrap entirely out of the per-tile
+   loop. Pass 1 stores raw atan2 angles in demod_raw[]. A single sequential
+   pass converts angles → frequencies over the entire field (no tile boundaries
+   in the unwrap at all). Pass 2 does tiled filtering on the unwrapped
+   frequencies. Comets STILL persisted.
+
+**Key observations**:
+- Artifacts do NOT appear at regular tile-boundary intervals (~6.2 lines/tile),
+  ruling out a simple tile-boundary phase discontinuity
+- Since the sequential phase unwrap fix didn't help, the root cause is NOT in
+  the phase unwrap step
+- The remaining suspects are: (a) insufficient overlap for the analytic signal
+  Hilbert transform (impulse response decays as 1/n — theoretically infinite),
+  (b) the tiled RF bandpass + Hilbert combination producing subtly different
+  analytic signal magnitudes/angles vs full-field even in valid regions,
+  (c) the 4096-sample overlap being insufficient for one or more of the
+  Pass 2 filters (video LPF, deemphasis shelf, sync FIR)
+- Envelope scaling: FFTW's unnormalized inverse C2C means tiled envelope
+  values are scaled by N_tile (~15K) while full-field values are scaled by
+  N_fullfield (~960K) — a ~62× difference. dropout_detect uses 18% of
+  field-mean envelope as threshold, so the relative threshold is unaffected,
+  but this discrepancy was never verified as harmless
+- Never got to the point of running both paths on the same input to diff
+  sample-by-sample (the definitive diagnostic)
+
+**Decision**: Abandoned tiling. The artifact is somewhere in the overlap-save
+interaction with the Hilbert transform / analytic signal creation, and the fix
+is not obvious. Full-field FFT at ~35 fps async is the baseline. Future
+optimization should target eliminating unnecessary FFTs (IIR filters for
+Pass 2, IIR biquad cascade for chroma bandpass) rather than trying to tile
+the existing FFT approach.
+
+### FFTW_MEASURE: tried and reverted (2026-03-27)
+
+Hypothesis: FFTW_ESTIMATE picks a naive FFT algorithm. FFTW_MEASURE benchmarks
+alternatives and picks cache-oblivious recursive decompositions that reduce L3
+misses. Theory: same FFT, same result, fewer cache misses.
+
+**Result**: 102s planning for worker 0 (first-time measurement of 960K-point
+FFTs). Wisdom cached so workers 1-22 planned in 0.3-1.4s each. But steady-state
+throughput dropped to **~26 fps** — a 4× regression from 110 fps.
+
+**Why it failed**: FFTW_MEASURE optimizes for single-threaded execution. The
+algorithm it chose likely uses wider radixes and larger stride patterns that are
+optimal when one FFT owns the entire cache hierarchy, but catastrophic when 23
+workers compete for 30MB L3. The "simple heuristic" from FFTW_ESTIMATE happens
+to cause less inter-worker interference.
+
+### Cache/bandwidth analysis and future optimization path (2026-03-27)
+
+**Current state**: ~35 fps full-field, 23 threads, i9-12900K. 2.7× scaling on
+23 threads (theoretical max: 23×). Bottleneck: DDR memory bandwidth wall
+(~25-30 GB/s practical). Each worker's 960K-point FFT touches ~15MB per
+operation. 23 workers = ~350MB hot data fighting for 30MB L3.
+
+**What can't be fixed**: Pass 1 of FM demod (RF bandpass + Hilbert transform)
+requires a full-field FFT. The Hilbert transform is fundamentally a
+frequency-domain operation.
+
+**What can be fixed** — eliminate FFTs that don't need to be FFTs:
+
+1. **FM demod pass 2** (~26% of total time): Video LPF, deemphasis shelf, and
+   sync FIR are just filters applied via FFT because cuVHS did it that way for
+   the GPU. On CPU, streaming IIR biquads do the same job with ~100 bytes
+   working set instead of 15MB.
+
+2. **Chroma bandpass** (~20-30% of total time): 480K-point FFT for a gentle
+   order-4 bandpass at 60kHz-1.2MHz. Textbook IIR biquad cascade,
+   forward-backward pass (sosfiltfilt) in time domain.
+
+**Estimated impact**: ~50% of FFT work eliminated. Remaining pass 1 FFT still
+hits memory bandwidth, but with half the demand, contention drops. Realistic
+target: 150-180 fps.
+
+**Beyond that**: would require fundamentally different demod approach
+(time-domain I/Q with local oscillator, like SDR) to eliminate the last FFT.
