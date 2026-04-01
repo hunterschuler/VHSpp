@@ -533,3 +533,133 @@ target: 150-180 fps.
 
 **Beyond that**: would require fundamentally different demod approach
 (time-domain I/Q with local oscillator, like SDR) to eliminate the last FFT.
+
+### 2026-04-01: Tear/chroma investigation cleanup and reset-to-baseline
+
+After several days of debugging the occasional lower-band tear/twist fields
+(for example field 173) and the more catastrophic chroma-failure fields
+(for example field 800), the tree accumulated a large number of experimental
+changes across the luma, sync, TBC, and chroma paths.
+
+We finally stepped back and separated the work into three buckets:
+
+1. **Things we tried that did not solve the real problem**
+2. **Things that produced only band-aid behavior**
+3. **Things that made chroma materially closer to `vhs-decode`**
+
+#### What we tried and are explicitly abandoning
+
+These changes were investigated, but are **not** part of the current committed
+baseline because they either failed outright or only turned one artifact into
+another:
+
+- **Chunk warm-up / heavy preroll overlap**
+  - Tried to address suspected async boundary effects.
+  - Crushed throughput and did not move field 173 at all.
+  - Conclusion: not a chunk-boundary problem.
+
+- **Bottom masking / hiding bad overscan lines**
+  - User explicitly did not want this.
+  - Did not fix the visible defect anyway.
+
+- **Burst-driven luma lineloc prepass**
+  - Added a per-field burst-timing pass before luma TBC.
+  - Preserved parallelism but cost a lot of performance.
+  - Did not materially improve the visible warp.
+
+- **Smoother whole-field TBC + lineloc repair as a “tear fix”**
+  - This reduced the hard tear into a softer warp/twist.
+  - It was useful diagnostically, because it proved the original visible tear
+    could be changed by TBC behavior.
+  - But it was still a band-aid: the underlying bad-field behavior remained.
+
+- **`linebad` plumbing through HSYNC/TBC/dropout plus `sanitize_linelocs()` and
+  `fix_badlines()`**
+  - Important investigation tools, but in practice these became part of a
+    luma-side repair stack that smoothed over the failure rather than removing
+    it.
+  - They were not enough to produce a clean, trustworthy fix for fields like 173.
+
+- **More aggressive `hsync_refine()` gating / porch reuse / right-edge heuristics**
+  - Helped change the shape of some bad fields.
+  - Did not eliminate the defect.
+  - Became entangled with the TBC band-aid path.
+
+- **Chroma line interpolation repair**
+  - This one turned out to be actively harmful.
+  - It was trying to “repair” bad lower-band chroma lines, but on fields like
+    173 it injected the very twist/wobble we were chasing.
+  - This is now considered a dead end unless revisited in a much more faithful
+    `vhs-decode`-style form.
+
+#### What we learned from the failed attempts
+
+- The stubborn `173`-class artifact is **not** primarily an async chunking issue.
+- It is **not** dropout concealment.
+- It is **not** explained by the bottommost head-switch lines alone.
+- The luma/TBC experiments could change the symptom, but not remove it.
+- The remaining “twist” was eventually shown to be substantially **chroma-side**.
+- The lower-band neon/chroma-meltdown failures could be suppressed, but some of
+  the first “fixes” were really just desaturation or grayscale fallbacks.
+
+#### What we kept
+
+We did a hard reset to `HEAD`, then selectively reintroduced only the chroma
+work that still looked worthwhile. The current committed baseline is:
+
+- **Commit**: `b533c00`
+- **Message**: `Improve chroma decoding toward vhs-decode parity`
+
+Only the chroma implementation file remains changed relative to the previous
+baseline:
+
+- `src/pipeline/chroma_decode.cpp`
+
+The current chroma changes worth keeping are:
+
+- **Per-field track scoring of both chroma hypotheses**
+  - Instead of mostly trusting carried chroma state, we now score both track
+    options every field and choose the better one by burst cancellation metric.
+  - This is much closer in spirit to `vhs-decode` and is robust on damaged fields.
+
+- **More complete chroma finishing**
+  - Added:
+    - NTSC comb filtering
+    - burst deemphasis
+    - chroma bad-line classification from burst metrics
+    - ACC gain clamping
+    - optional field-wide phase rotation experiment
+  - These changes made color materially closer to `vhs-decode`.
+
+- **Removal of chroma line-repair from the default path**
+  - This was the key breakthrough for the `173`-class twist.
+  - The old chroma line-repair stage was smearing chroma timing/phase and
+    injecting distortion into otherwise salvageable fields.
+  - It remains a debug-only option, not part of the default path.
+
+#### Current state of the committed baseline
+
+The current baseline is intentionally **not** a full fix. It is a reset to a
+cleaner place with one real improvement preserved:
+
+- **Better than before**:
+  - Chroma/color is noticeably closer to `vhs-decode`.
+  - The worst lower-band chroma catastrophes are reduced.
+
+- **Still not solved**:
+  - The picture is still somewhat noisier than `vhs-decode`.
+  - The lower-band tear/twist problem is still unresolved.
+  - We intentionally removed the luma/TBC/HSYNC band-aids rather than pretend
+    they were a real solution.
+
+#### Why we reset instead of piling on more fixes
+
+The experimental branch had become a mix of real chroma improvements and a large
+amount of luma/TBC repair logic that was mostly masking the original failure.
+That made it harder to tell what was genuinely helping.
+
+Resetting to a chroma-only improvement baseline gives us:
+
+- a cleaner starting point
+- a known-good stash containing all the experiments
+- a committed baseline where any future change is easier to evaluate honestly
