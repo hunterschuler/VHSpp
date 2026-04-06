@@ -1,6 +1,7 @@
 #include "vhsdecode_cpp/vsync_serration.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <limits>
@@ -31,6 +32,16 @@ double t_to_samples(double samp_rate, double time) {
 template <typename T>
 std::vector<T> reversed_copy(const std::vector<T>& in) {
     return std::vector<T>(in.rbegin(), in.rend());
+}
+
+double median_inplace_cpp(std::vector<double>& values) {
+    if (values.empty()) return 0.0;
+    const std::size_t mid = values.size() / 2U;
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(mid), values.end());
+    const double upper = values[mid];
+    if ((values.size() & 1U) != 0U) return upper;
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(mid - 1U), values.begin() + static_cast<std::ptrdiff_t>(mid));
+    return 0.5 * (values[mid - 1U] + upper);
 }
 
 std::vector<double> odd_ext(const std::vector<double>& x, std::size_t edge) {
@@ -154,13 +165,32 @@ std::pair<std::vector<double>, std::vector<double>> iir_lfilter_cpp(
 std::vector<double> iir_filtfilt_cpp(
     const std::vector<double>& b,
     const std::vector<double>& a,
+    const std::vector<double>& zi_base,
+    const std::vector<double>& input,
+    std::size_t edge);
+
+std::vector<double> iir_filtfilt_cpp(
+    const std::vector<double>& b,
+    const std::vector<double>& a,
     const std::vector<double>& input) {
+    const auto zi_base = lfilter_zi_cpp(b, a);
     const std::size_t ntaps = std::max(a.size(), b.size());
     if (input.size() <= 1) return input;
     std::size_t edge = 3 * ntaps;
     edge = std::min(edge, input.size() - 1);
+    return iir_filtfilt_cpp(b, a, zi_base, input, edge);
+}
+
+std::vector<double> iir_filtfilt_cpp(
+    const std::vector<double>& b,
+    const std::vector<double>& a,
+    const std::vector<double>& zi_base,
+    const std::vector<double>& input,
+    std::size_t edge) {
+    const std::size_t ntaps = std::max(a.size(), b.size());
+    if (input.size() <= 1) return input;
+    edge = std::min(edge, input.size() - 1);
     const std::vector<double> ext = odd_ext(input, edge);
-    auto zi_base = lfilter_zi_cpp(b, a);
     std::vector<double> zi(zi_base.size());
     const double x0 = ext.front();
     for (std::size_t i = 0; i < zi.size(); ++i) zi[i] = zi_base[i] * x0;
@@ -173,6 +203,79 @@ std::vector<double> iir_filtfilt_cpp(
     if (edge == 0) return y2;
     return std::vector<double>(y2.begin() + static_cast<std::ptrdiff_t>(edge),
                                y2.end() - static_cast<std::ptrdiff_t>(edge));
+}
+
+void iir_lfilter_into_cpp(const std::vector<double>& b,
+                          const std::vector<double>& a,
+                          const std::vector<double>& input,
+                          const std::vector<double>& zi_init,
+                          std::vector<double>& out,
+                          std::vector<double>& zi) {
+    const std::size_t n = a.size();
+    zi.resize(n - 1, 0.0);
+    std::copy(zi_init.begin(), zi_init.end(), zi.begin());
+    out.resize(input.size());
+    const double* const bptr = b.data();
+    const double* const aptr = a.data();
+    switch (n) {
+    case 4:
+        for (std::size_t i = 0; i < input.size(); ++i) {
+            const double x = input[i];
+            const double z0 = zi[0];
+            const double z1 = zi[1];
+            const double z2 = zi[2];
+            const double y = (bptr[0] * x) + z0;
+            out[i] = y;
+            zi[0] = z1 + (bptr[1] * x) - (aptr[1] * y);
+            zi[1] = z2 + (bptr[2] * x) - (aptr[2] * y);
+            zi[2] = (bptr[3] * x) - (aptr[3] * y);
+        }
+        return;
+    case 5:
+        for (std::size_t i = 0; i < input.size(); ++i) {
+            const double x = input[i];
+            const double z0 = zi[0];
+            const double z1 = zi[1];
+            const double z2 = zi[2];
+            const double z3 = zi[3];
+            const double y = (bptr[0] * x) + z0;
+            out[i] = y;
+            zi[0] = z1 + (bptr[1] * x) - (aptr[1] * y);
+            zi[1] = z2 + (bptr[2] * x) - (aptr[2] * y);
+            zi[2] = z3 + (bptr[3] * x) - (aptr[3] * y);
+            zi[3] = (bptr[4] * x) - (aptr[4] * y);
+        }
+        return;
+    case 6:
+        for (std::size_t i = 0; i < input.size(); ++i) {
+            const double x = input[i];
+            const double z0 = zi[0];
+            const double z1 = zi[1];
+            const double z2 = zi[2];
+            const double z3 = zi[3];
+            const double z4 = zi[4];
+            const double y = (bptr[0] * x) + z0;
+            out[i] = y;
+            zi[0] = z1 + (bptr[1] * x) - (aptr[1] * y);
+            zi[1] = z2 + (bptr[2] * x) - (aptr[2] * y);
+            zi[2] = z3 + (bptr[3] * x) - (aptr[3] * y);
+            zi[3] = z4 + (bptr[4] * x) - (aptr[4] * y);
+            zi[4] = (bptr[5] * x) - (aptr[5] * y);
+        }
+        return;
+    default:
+        for (std::size_t i = 0; i < input.size(); ++i) {
+            const double x = input[i];
+            double y = bptr[0] * x;
+            if (!zi.empty()) y += zi[0];
+            out[i] = y;
+            for (std::size_t j = 0; j + 1 < zi.size(); ++j) {
+                zi[j] = zi[j + 1] + bptr[j + 1] * x - aptr[j + 1] * y;
+            }
+            if (!zi.empty()) zi.back() = bptr[n - 1] * x - aptr[n - 1] * y;
+        }
+        return;
+    }
 }
 
 std::pair<int, double> buttord_cpp(double wp_hz,
@@ -297,9 +400,21 @@ std::pair<std::vector<double>, std::vector<double>> firdes_highpass_cpp(
     return butter_digital_highpass_ba_cpp(order, normal_cutoff, samp_rate);
 }
 
-std::vector<int> zero_cross_det_cpp(const std::vector<double>& data) {
-    std::vector<int> out;
-    if (data.size() < 2) return out;
+void normalize_filter_cpp(std::vector<double>& b, std::vector<double>& a) {
+    require(!a.empty() && !b.empty(), "iir filter coefficients are empty");
+    if (a.front() != 1.0) {
+        const double a0 = a.front();
+        for (double& v : a) v /= a0;
+        for (double& v : b) v /= a0;
+    }
+    const std::size_t n = std::max(a.size(), b.size());
+    a.resize(n, 0.0);
+    b.resize(n, 0.0);
+}
+
+void zero_cross_det_into_cpp(const std::vector<double>& data, std::vector<int>& out) {
+    out.clear();
+    if (data.size() < 2) return;
     out.reserve(data.size() / 8);
     for (std::size_t i = 1; i < data.size(); ++i) {
         const double prev = data[i - 1];
@@ -308,19 +423,34 @@ std::vector<int> zero_cross_det_cpp(const std::vector<double>& data) {
         const int sc = (curr > 0.0) - (curr < 0.0);
         if (sp != sc) out.push_back(static_cast<int>(i - 1));
     }
-    return out;
 }
 
-std::vector<int> argrelextrema_less_cpp(const std::vector<double>& data) {
-    std::vector<int> out;
-    if (data.size() < 3) return out;
+void argrelextrema_less_into_cpp(const std::vector<double>& data, std::vector<int>& out) {
+    out.clear();
+    if (data.size() < 3) return;
     for (std::size_t i = 1; i + 1 < data.size(); ++i) {
         if (data[i] < data[i - 1] && data[i] < data[i + 1]) {
             out.push_back(static_cast<int>(i));
         }
     }
-    return out;
 }
+
+void argrelextrema_less_shifted_into_cpp(const std::vector<double>& data,
+                                         std::size_t begin,
+                                         double bias,
+                                         std::vector<int>& out) {
+    out.clear();
+    if (begin + 2 >= data.size()) return;
+    for (std::size_t i = begin + 1; i + 1 < data.size(); ++i) {
+        const double prev = data[i - 1] - bias;
+        const double curr = data[i] - bias;
+        const double next = data[i + 1] - bias;
+        if (curr < prev && curr < next) {
+            out.push_back(static_cast<int>(i - begin));
+        }
+    }
+}
+
 
 std::pair<double, double> get_serration_sync_levels_cpp(const std::vector<double>& serration) {
     const double half_amp = std::accumulate(serration.begin(), serration.end(), 0.0) /
@@ -335,12 +465,7 @@ std::pair<double, double> get_serration_sync_levels_cpp(const std::vector<double
     }
     auto median_of = [](std::vector<double> values) {
         if (values.empty()) return 0.0;
-        std::sort(values.begin(), values.end());
-        const std::size_t mid = values.size() / 2U;
-        if ((values.size() % 2U) == 0U) {
-            return 0.5 * (values[mid - 1U] + values[mid]);
-        }
-        return values[mid];
+        return median_inplace_cpp(values);
     };
     return {median_of(valleys), median_of(peaks)};
 }
@@ -384,17 +509,29 @@ VsyncSerration::VsyncSerration(const VsyncSerrationConfig& config)
     const auto iir_vsync_env = firdes_lowpass_cpp(samp_rate_, fv * 5.0, 1e3);
     vsync_env_b_ = iir_vsync_env.first;
     vsync_env_a_ = iir_vsync_env.second;
+    normalize_filter_cpp(vsync_env_b_, vsync_env_a_);
+    vsync_env_zi_ = lfilter_zi_cpp(vsync_env_b_, vsync_env_a_);
+    vsync_env_edge_ = 3 * vsync_env_a_.size();
 
     const auto iir_serration_base_lo = firdes_highpass_cpp(samp_rate_, fh, fh);
     serration_base_lo_b_ = iir_serration_base_lo.first;
     serration_base_lo_a_ = iir_serration_base_lo.second;
+    normalize_filter_cpp(serration_base_lo_b_, serration_base_lo_a_);
+    serration_base_lo_zi_ = lfilter_zi_cpp(serration_base_lo_b_, serration_base_lo_a_);
+    serration_base_lo_edge_ = 3 * serration_base_lo_a_.size();
     const auto iir_serration_base_hi = firdes_lowpass_cpp(samp_rate_, fh, fh);
     serration_base_hi_b_ = iir_serration_base_hi.first;
     serration_base_hi_a_ = iir_serration_base_hi.second;
+    normalize_filter_cpp(serration_base_hi_b_, serration_base_hi_a_);
+    serration_base_hi_zi_ = lfilter_zi_cpp(serration_base_hi_b_, serration_base_hi_a_);
+    serration_base_hi_edge_ = 3 * serration_base_hi_a_.size();
 
     const auto iir_serration_envelope_lo = firdes_lowpass_cpp(samp_rate_, fh / 3.0, fh / 2.0);
     serration_envelope_b_ = iir_serration_envelope_lo.first;
     serration_envelope_a_ = iir_serration_envelope_lo.second;
+    normalize_filter_cpp(serration_envelope_b_, serration_envelope_a_);
+    serration_envelope_zi_ = lfilter_zi_cpp(serration_envelope_b_, serration_envelope_a_);
+    serration_envelope_edge_ = 3 * serration_envelope_a_.size();
 
     eq_pulselen_ = static_cast<int>(std::llround(
         t_to_samples(samp_rate_, config.sysparams.eq_pulse_us * 1e-6)));
@@ -438,37 +575,101 @@ std::vector<double> VsyncSerration::remove_bias(const std::vector<double>& data)
     return out;
 }
 
-std::pair<std::vector<double>, double> VsyncSerration::vsync_envelope_simple(
-    const std::vector<double>& data) const {
-    std::vector<double> hi_part = data;
-    for (double& v : hi_part) {
-        if (v < 0.0) v = 0.0;
-    }
-    return {iir_filtfilt_cpp(vsync_env_b_, vsync_env_a_, hi_part),
-            *std::min_element(data.begin(), data.end())};
+std::vector<double> VsyncSerration::filtfilt_cached(const std::vector<double>& b,
+                                                    const std::vector<double>& a,
+                                                    const std::vector<double>& zi_base,
+                                                    const std::vector<double>& input,
+                                                    std::size_t edge) const {
+    std::vector<double> output;
+    filtfilt_into(b, a, zi_base, input, edge, output);
+    return output;
 }
 
-std::pair<std::vector<double>, double> VsyncSerration::vsync_envelope_double(
-    const std::vector<double>& data) const {
+void VsyncSerration::filtfilt_into(const std::vector<double>& b,
+                                   const std::vector<double>& a,
+                                   const std::vector<double>& zi_base,
+                                   const std::vector<double>& input,
+                                   std::size_t edge,
+                                   std::vector<double>& output) const {
+    if (input.size() <= 1) {
+        output = input;
+        return;
+    }
+    edge = std::min(edge, input.size() - 1);
+    filt_ext_work_.resize(input.size() + 2U * edge);
+    const double left = input.front();
+    const double right = input.back();
+    for (std::size_t i = 0; i < edge; ++i) {
+        filt_ext_work_[i] = (2.0 * left) - input[edge - i];
+    }
+    std::copy(input.begin(), input.end(), filt_ext_work_.begin() + static_cast<std::ptrdiff_t>(edge));
+    for (std::size_t i = 0; i < edge; ++i) {
+        filt_ext_work_[edge + input.size() + i] = (2.0 * right) - input[input.size() - 2 - i];
+    }
+
+    filt_zi_work_.resize(zi_base.size());
+    const double x0 = filt_ext_work_.front();
+    for (std::size_t i = 0; i < zi_base.size(); ++i) filt_zi_work_[i] = zi_base[i] * x0;
+    iir_lfilter_into_cpp(b, a, filt_ext_work_, filt_zi_work_, filt_stage_work_, filt_zi_work_);
+
+    std::reverse(filt_stage_work_.begin(), filt_stage_work_.end());
+    const double y0 = filt_stage_work_.front();
+    for (std::size_t i = 0; i < zi_base.size(); ++i) filt_zi_work_[i] = zi_base[i] * y0;
+    iir_lfilter_into_cpp(b, a, filt_stage_work_, filt_zi_work_, filt_stage2_work_, filt_zi_work_);
+    std::reverse(filt_stage2_work_.begin(), filt_stage2_work_.end());
+
+    if (edge == 0) {
+        output = filt_stage2_work_;
+        return;
+    }
+    const std::size_t out_size = filt_stage2_work_.size() - (2U * edge);
+    output.resize(out_size);
+    std::copy(filt_stage2_work_.begin() + static_cast<std::ptrdiff_t>(edge),
+              filt_stage2_work_.begin() + static_cast<std::ptrdiff_t>(edge + out_size),
+              output.begin());
+}
+
+double VsyncSerration::vsync_envelope_simple_into(const std::vector<double>& data,
+                                                  std::vector<double>& output) const {
+    hi_part_work_.resize(data.size());
+    double min_value = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        const double v = data[i];
+        if (v < min_value) min_value = v;
+        hi_part_work_[i] = (v < 0.0) ? 0.0 : v;
+    }
+    filtfilt_into(vsync_env_b_, vsync_env_a_, vsync_env_zi_, hi_part_work_, vsync_env_edge_, output);
+    return min_value;
+}
+
+double VsyncSerration::vsync_envelope_double_into(const std::vector<double>& data,
+                                                  std::vector<double>& output) const {
     const int half = static_cast<int>(data.size() / 2U);
-    auto forward = vsync_envelope_simple(data);
-    auto reversed = reversed_copy(data);
-    auto reverse = iir_filtfilt_cpp(vsync_env_b_, vsync_env_a_, reversed);
-    std::reverse(reverse.begin(), reverse.end());
-    std::vector<double> result = data;
-    for (int i = 0; i < half; ++i) result[static_cast<std::size_t>(i)] = reverse[static_cast<std::size_t>(i)];
-    for (std::size_t i = static_cast<std::size_t>(half); i < result.size(); ++i) {
-        result[i] = forward.first[i];
+    const double min_value = vsync_envelope_simple_into(data, envelope_forward_work_);
+    reverse_work_.resize(data.size());
+    std::reverse_copy(data.begin(), data.end(), reverse_work_.begin());
+    filtfilt_into(vsync_env_b_, vsync_env_a_, vsync_env_zi_, reverse_work_, vsync_env_edge_, envelope_reverse_result_work_);
+    std::reverse(envelope_reverse_result_work_.begin(), envelope_reverse_result_work_.end());
+    output = envelope_forward_work_;
+    for (int i = 0; i < half; ++i) {
+        output[static_cast<std::size_t>(i)] = envelope_reverse_result_work_[static_cast<std::size_t>(i)];
     }
-    return {std::move(result), forward.second};
+    return min_value;
 }
 
-std::vector<int> VsyncSerration::power_ratio_search(const std::vector<double>& data) const {
-    auto first = iir_filtfilt_cpp(serration_base_lo_b_, serration_base_lo_a_, data);
-    first = iir_filtfilt_cpp(serration_base_hi_b_, serration_base_hi_a_, first);
-    for (double& v : first) v *= v;
-    first = iir_filtfilt_cpp(serration_envelope_b_, serration_envelope_a_, first);
-    return argrelextrema_less_cpp(first);
+const std::vector<int>& VsyncSerration::power_ratio_search(const std::vector<double>& data) const {
+    filtfilt_into(
+        serration_base_lo_b_, serration_base_lo_a_, serration_base_lo_zi_, data,
+        serration_base_lo_edge_, power_stage_work_);
+    filtfilt_into(
+        serration_base_hi_b_, serration_base_hi_a_, serration_base_hi_zi_, power_stage_work_,
+        serration_base_hi_edge_, power_stage2_work_);
+    for (double& v : power_stage2_work_) v *= v;
+    filtfilt_into(
+        serration_envelope_b_, serration_envelope_a_, serration_envelope_zi_, power_stage2_work_,
+        serration_envelope_edge_, power_stage_work_);
+    argrelextrema_less_into_cpp(power_stage_work_, serrations_work_);
+    return serrations_work_;
 }
 
 std::optional<std::vector<int>> VsyncSerration::vsync_arbitrage(
@@ -516,15 +717,13 @@ std::pair<bool, std::optional<std::pair<int, int>>> VsyncSerration::search_eq_pu
     std::vector<double> min_block(data.begin() + start, data.begin() + end);
     const double min_block_min = *std::min_element(min_block.begin(), min_block.end());
     std::vector<double> tmp = min_block;
-    std::sort(tmp.begin(), tmp.end());
-    const double med = (tmp.size() % 2U == 0U)
-        ? 0.5 * (tmp[tmp.size() / 2U - 1U] + tmp[tmp.size() / 2U])
-        : tmp[tmp.size() / 2U];
+    const double med = median_inplace_cpp(tmp);
     double level = (med - min_block_min) / 2.0;
     level += min_block_min;
     std::vector<double> zero_block(min_block.size());
     for (std::size_t i = 0; i < min_block.size(); ++i) zero_block[i] = min_block[i] - level;
-    const std::vector<int> sync_pulses = zero_cross_det_cpp(zero_block);
+    zero_cross_det_into_cpp(zero_block, zero_cross_work_);
+    const std::vector<int>& sync_pulses = zero_cross_work_;
     if (sync_pulses.size() < 2U) return {false, std::nullopt};
     std::vector<int> where_min_diff;
     for (std::size_t i = 0; i + 1U < sync_pulses.size(); ++i) {
@@ -557,54 +756,84 @@ std::pair<bool, std::optional<std::pair<int, int>>> VsyncSerration::search_eq_pu
 }
 
 std::optional<bool> VsyncSerration::vsync_envelope(const std::vector<double>& data, int padding) {
-    std::vector<double> padded;
-    padded.reserve(static_cast<std::size_t>(padding) + data.size());
-    const std::vector<double> prefix = reversed_copy(
-        std::vector<double>(data.begin(), data.begin() + std::min<int>(padding, static_cast<int>(data.size()))));
-    padded.insert(padded.end(), prefix.begin(), prefix.end());
-    padded.insert(padded.end(), data.begin(), data.end());
+    const auto t_envelope_0 = std::chrono::steady_clock::now();
+    const std::size_t prefix_len =
+        static_cast<std::size_t>(std::min<int>(padding, static_cast<int>(data.size())));
+    padded_work_.resize(prefix_len + data.size());
+    for (std::size_t i = 0; i < prefix_len; ++i) {
+        padded_work_[i] = data[prefix_len - 1U - i];
+    }
+    std::copy(data.begin(), data.end(), padded_work_.begin() + static_cast<std::ptrdiff_t>(prefix_len));
 
-    auto forward = vsync_envelope_double(padded);
-    sync_level_bias_ = forward.second;
-    std::vector<double> diff(forward.first.begin() + std::min<int>(padding, static_cast<int>(forward.first.size())),
-                             forward.first.end());
-    for (double& v : diff) v -= sync_level_bias_;
-    const auto where_allmin = argrelextrema_less_cpp(diff);
-    last_debug_ = {};
-    last_debug_.envelope = diff;
-    last_debug_.minima = where_allmin;
+    sync_level_bias_ = vsync_envelope_double_into(padded_work_, envelope_result_work_);
+    const std::size_t trim =
+        static_cast<std::size_t>(std::min<int>(padding, static_cast<int>(envelope_result_work_.size())));
+    argrelextrema_less_shifted_into_cpp(envelope_result_work_, trim, sync_level_bias_, minima_work_);
+    const auto& where_allmin = minima_work_;
+    if (show_decoded_) {
+        last_debug_ = {};
+        diff_work_.resize(envelope_result_work_.size() - trim);
+        for (std::size_t i = 0; i < diff_work_.size(); ++i) {
+            diff_work_[i] = envelope_result_work_[trim + i] - sync_level_bias_;
+        }
+        last_debug_.envelope = diff_work_;
+        last_debug_.minima = where_allmin;
+    }
     if (where_allmin.empty()) return std::nullopt;
-    const auto serrations = power_ratio_search(padded);
-    last_debug_.serrations = serrations;
-    auto where_min = vsync_arbitrage(where_allmin, serrations, static_cast<int>(padded.size()));
+    perf_stats_.envelope_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_envelope_0).count();
+    const auto t_power_0 = std::chrono::steady_clock::now();
+    const auto& serrations = power_ratio_search(padded_work_);
+    perf_stats_.power_ratio_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_power_0).count();
+    if (show_decoded_) {
+        last_debug_.serrations = serrations;
+    }
+    auto where_min = vsync_arbitrage(where_allmin, serrations, static_cast<int>(padded_work_.size()));
     if (!where_min.has_value()) return std::nullopt;
-    last_debug_.arbitrated = *where_min;
+    if (show_decoded_) {
+        last_debug_.arbitrated = *where_min;
+    }
     std::vector<int> serration_locs;
     int mask_len = linelen_ * 5;
     bool state = false;
     for (int w_min : *where_min) {
+        const auto t_search_0 = std::chrono::steady_clock::now();
         auto [ok, locs] = search_eq_pulses(data, w_min);
+        perf_stats_.search_eq_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_search_0).count();
         if (ok && locs.has_value()) {
             serration_locs.push_back(locs->first);
             mask_len = locs->second - locs->first;
             state = true;
         }
     }
-    last_debug_.serration_locs = serration_locs;
-    last_debug_.mask_len = mask_len;
-    last_debug_.state = state;
+    if (show_decoded_) {
+        last_debug_.serration_locs = serration_locs;
+        last_debug_.mask_len = mask_len;
+        last_debug_.state = state;
+    }
     return state;
 }
 
 void VsyncSerration::work(const std::vector<double>& data) {
     found_serration_ = false;
-    std::vector<double> reduced;
-    reduced.reserve((data.size() + static_cast<std::size_t>(divisor_) - 1U) /
-                    static_cast<std::size_t>(divisor_));
-    for (std::size_t i = 0; i < data.size(); i += static_cast<std::size_t>(divisor_)) {
-        reduced.push_back(data[i]);
+    const auto t_reduce_0 = std::chrono::steady_clock::now();
+    if (divisor_ == 1) {
+        perf_stats_.work_reduce_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_reduce_0).count();
+        (void)vsync_envelope(data);
+    } else {
+        reduced_work_.clear();
+        reduced_work_.reserve((data.size() + static_cast<std::size_t>(divisor_) - 1U) /
+                              static_cast<std::size_t>(divisor_));
+        for (std::size_t i = 0; i < data.size(); i += static_cast<std::size_t>(divisor_)) {
+            reduced_work_.push_back(data[i]);
+        }
+        perf_stats_.work_reduce_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_reduce_0).count();
+        (void)vsync_envelope(reduced_work_);
     }
-    (void)vsync_envelope(reduced);
     fieldcount_ += 1;
 }
 

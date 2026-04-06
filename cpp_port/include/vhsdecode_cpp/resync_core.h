@@ -51,4 +51,14 @@ void findpulses_numba_raw_reduced(
     std::vector<int>& starts,
     std::vector<int>& lengths);
 
+void findpulses_numba_raw_reduced_into(
+    const std::vector<double>& sync_ref,
+    double high,
+    int divisor,
+    double min_synclen,
+    double max_synclen,
+    std::vector<double>& reduced,
+    std::vector<int>& starts,
+    std::vector<int>& lengths);
+
 }  // namespace vhsdecode_cpp

@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     vhsdecode::cppport::VsyncSerrationConfig cfg{};
     cfg.sample_rate_hz = parse_num<double>(kv, "sample_rate_hz");
     cfg.divisor = parse_num<int>(kv, "divisor");
-    cfg.show_decoded_serration = false;
+    cfg.show_decoded_serration = true;
     cfg.sysparams.fps = parse_num<double>(kv, "fps");
     cfg.sysparams.frame_lines = parse_num<int>(kv, "frame_lines");
     cfg.sysparams.eq_pulse_us = parse_num<double>(kv, "eq_pulse_us");

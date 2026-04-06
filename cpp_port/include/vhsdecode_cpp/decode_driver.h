@@ -22,6 +22,7 @@ struct DecodeDriverConfig {
     int debug_capture_seq = 1;
     int max_fields = -1;
     int max_attempts = -1;
+    int threads = 1;
     bool verbose = true;
 };
 

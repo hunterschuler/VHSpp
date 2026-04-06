@@ -29,6 +29,13 @@ struct VsyncEnvelopeDebug {
     bool state = false;
 };
 
+struct VsyncPerfStats {
+    double work_reduce_s = 0.0;
+    double envelope_s = 0.0;
+    double power_ratio_s = 0.0;
+    double search_eq_s = 0.0;
+};
+
 class VsyncSerration {
 public:
     explicit VsyncSerration(const VsyncSerrationConfig& config);
@@ -48,6 +55,8 @@ public:
 
     double sync_level_bias() const { return sync_level_bias_; }
     const VsyncEnvelopeDebug& last_debug() const { return last_debug_; }
+    const VsyncPerfStats& perf_stats() const { return perf_stats_; }
+    void reset_perf_stats() { perf_stats_ = {}; }
 
 private:
     class StackableMA {
@@ -76,12 +85,20 @@ private:
 
     std::vector<double> vsync_env_b_;
     std::vector<double> vsync_env_a_;
+    std::vector<double> vsync_env_zi_;
+    std::size_t vsync_env_edge_ = 0;
     std::vector<double> serration_base_lo_b_;
     std::vector<double> serration_base_lo_a_;
+    std::vector<double> serration_base_lo_zi_;
+    std::size_t serration_base_lo_edge_ = 0;
     std::vector<double> serration_base_hi_b_;
     std::vector<double> serration_base_hi_a_;
+    std::vector<double> serration_base_hi_zi_;
+    std::size_t serration_base_hi_edge_ = 0;
     std::vector<double> serration_envelope_b_;
     std::vector<double> serration_envelope_a_;
+    std::vector<double> serration_envelope_zi_;
+    std::size_t serration_envelope_edge_ = 0;
 
     StackableMA sync_levels_;
     StackableMA blank_levels_;
@@ -89,12 +106,30 @@ private:
     int fieldcount_ = 0;
     bool found_serration_ = false;
     VsyncEnvelopeDebug last_debug_;
+    VsyncPerfStats perf_stats_;
+    std::vector<double> reduced_work_;
+    std::vector<double> padded_work_;
+    std::vector<double> diff_work_;
+    mutable std::vector<double> hi_part_work_;
+    mutable std::vector<double> reverse_work_;
+    mutable std::vector<double> filt_ext_work_;
+    mutable std::vector<double> filt_stage_work_;
+    mutable std::vector<double> filt_stage2_work_;
+    mutable std::vector<double> filt_zi_work_;
+    mutable std::vector<double> power_stage_work_;
+    mutable std::vector<double> power_stage2_work_;
+    mutable std::vector<double> envelope_forward_work_;
+    mutable std::vector<double> envelope_reverse_result_work_;
+    mutable std::vector<double> envelope_result_work_;
+    mutable std::vector<int> minima_work_;
+    mutable std::vector<int> serrations_work_;
+    mutable std::vector<int> zero_cross_work_;
 
-    std::pair<std::vector<double>, double> vsync_envelope_simple(
-        const std::vector<double>& data) const;
-    std::pair<std::vector<double>, double> vsync_envelope_double(
-        const std::vector<double>& data) const;
-    std::vector<int> power_ratio_search(const std::vector<double>& data) const;
+    double vsync_envelope_simple_into(const std::vector<double>& data,
+                                      std::vector<double>& output) const;
+    double vsync_envelope_double_into(const std::vector<double>& data,
+                                      std::vector<double>& output) const;
+    const std::vector<int>& power_ratio_search(const std::vector<double>& data) const;
     std::optional<std::vector<int>> vsync_arbitrage(
         const std::vector<int>& where_allmin,
         const std::vector<int>& serrations,
@@ -104,6 +139,17 @@ private:
         int pos,
         int linespan = 30);
     std::optional<bool> vsync_envelope(const std::vector<double>& data, int padding = 1024);
+    std::vector<double> filtfilt_cached(const std::vector<double>& b,
+                                        const std::vector<double>& a,
+                                        const std::vector<double>& zi_base,
+                                        const std::vector<double>& input,
+                                        std::size_t edge) const;
+    void filtfilt_into(const std::vector<double>& b,
+                       const std::vector<double>& a,
+                       const std::vector<double>& zi_base,
+                       const std::vector<double>& input,
+                       std::size_t edge,
+                       std::vector<double>& output) const;
 };
 
 }  // namespace vhsdecode::cppport

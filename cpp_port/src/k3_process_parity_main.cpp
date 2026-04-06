@@ -203,6 +203,7 @@ int main(int argc, char** argv) {
     input.disable_phase_correction = parse_num_default<int>(kv, "disable_phase_correction", 0) != 0;
     input.do_chroma_deemphasis = parse_num_default<int>(kv, "do_chroma_deemphasis", 0) != 0;
     input.enable_video_notch = parse_num_default<int>(kv, "enable_video_notch", 0) != 0;
+    input.keep_intermediates = true;
     if (parse_num<int>(kv, "burst_phase_avg_present") != 0) {
         input.burst_phase_avg = parse_num<double>(kv, "burst_phase_avg");
     }

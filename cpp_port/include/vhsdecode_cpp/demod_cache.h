@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -31,14 +32,15 @@ class DemodCache {
 public:
     DemodCache(const std::filesystem::path& raw_path,
                const vhsdecode::cppport::K1BuildConfig& cfg,
-               vhsdecode::cppport::K1Context ctx,
+               std::shared_ptr<const vhsdecode::cppport::K1Context> ctx,
                std::size_t blockcut,
                std::size_t blockcut_end,
                std::size_t cache_size = 256);
 
     std::optional<DemodCacheReadResult> read(std::uint64_t begin,
                                              std::uint64_t length,
-                                             bool force_redo = false);
+                                             bool force_redo = false,
+                                             bool include_input = false);
 
     void flush_demod();
 
@@ -57,12 +59,13 @@ private:
 
     bool load_raw_block(std::uint64_t blocknum);
     bool ensure_demod_block(std::uint64_t blocknum, bool force_redo);
+    void ensure_input_block(BlockEntry& block);
     void prune_cache();
     static void lru_touch(std::vector<std::uint64_t>& lru, std::uint64_t key);
 
     std::ifstream in_;
     vhsdecode::cppport::K1BuildConfig cfg_{};
-    vhsdecode::cppport::K1Context ctx_{};
+    std::shared_ptr<const vhsdecode::cppport::K1Context> ctx_{};
     std::size_t blockcut_ = 0;
     std::size_t blockcut_end_ = 0;
     std::size_t blocksize_ = 0;
@@ -70,6 +73,7 @@ private:
     std::size_t cache_size_ = 256;
     std::unordered_map<std::uint64_t, BlockEntry> blocks_;
     std::vector<std::uint64_t> lru_;
+    std::size_t transient_keep_blocks_ = 0;
 };
 
 }  // namespace vhsdecode_cpp

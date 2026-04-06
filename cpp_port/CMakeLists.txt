@@ -6,6 +6,7 @@ add_library(vhsdecode_k1_port
     src/chroma_phase.cpp
     src/chroma_process.cpp
     src/downscale_core.cpp
+    src/hardware_info.cpp
     src/metadata_core.cpp
     src/output_core.cpp
     src/readfield_control_core.cpp

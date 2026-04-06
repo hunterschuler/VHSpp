@@ -27,6 +27,7 @@ struct DownscaleCoreInput {
     double out_scale = 0.0;
     int wow_spline_degree = 1;
     bool wow_spline_precomputed = false;
+    bool keep_debug_arrays = false;
 };
 
 struct DownscaleCoreResult {

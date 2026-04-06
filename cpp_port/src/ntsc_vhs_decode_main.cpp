@@ -2,6 +2,8 @@
 #include "vhsdecode_cpp/decode_driver.h"
 #include "vhsdecode_cpp/demod_cache.h"
 #include "vhsdecode_cpp/downscale_core.h"
+#include "vhsdecode_cpp/fftw_guard.h"
+#include "vhsdecode_cpp/hardware_info.h"
 #include "vhsdecode_cpp/k1_context.h"
 #include "vhsdecode_cpp/metadata_core.h"
 #include "vhsdecode_cpp/output_core.h"
@@ -21,10 +23,13 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 
@@ -381,8 +386,36 @@ struct RuntimeState {
 struct DriverPerfStats {
     double read_s = 0.0;
     double k2_s = 0.0;
+    double k2_get_pulses_s = 0.0;
+    double k2_serration_work_s = 0.0;
+    double k2_serration_reduce_s = 0.0;
+    double k2_serration_envelope_s = 0.0;
+    double k2_serration_power_ratio_s = 0.0;
+    double k2_serration_search_eq_s = 0.0;
+    double k2_add_pulselevels_s = 0.0;
+    double k2_level_apply_s = 0.0;
+    double k2_final_findpulses_s = 0.0;
+    double k2_refine_pulses_s = 0.0;
+    double k2_first_hsync_s = 0.0;
+    double k2_linelocs0_s = 0.0;
+    double k2_hsync_refine_s = 0.0;
     double k3_s = 0.0;
+    double k3_burst_refine_s = 0.0;
+    double k3_fix_badlines_s = 0.0;
+    double k3_phase_offset_s = 0.0;
+    double k3_detect_levels_s = 0.0;
     double k4_s = 0.0;
+    double k4_luma_s = 0.0;
+    double k4_chroma_s = 0.0;
+    double k4_chroma_cafc_prefilter_s = 0.0;
+    double k4_chroma_burst_deemph_s = 0.0;
+    double k4_chroma_upconvert_s = 0.0;
+    double k4_chroma_phase_comp_s = 0.0;
+    double k4_chroma_final_filter_s = 0.0;
+    double k4_chroma_deemph_s = 0.0;
+    double k4_chroma_comb_s = 0.0;
+    double k4_chroma_acc_s = 0.0;
+    double k4_chroma_to_u16_s = 0.0;
     double write_s = 0.0;
 };
 
@@ -809,7 +842,21 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
     fin.color_system = "NTSC";
     fin.fallback_vsync = false;
     fin.disable_dc_offset = false;
+    const auto t_k2_pulses_0 = std::chrono::steady_clock::now();
+    resync.reset_perf_stats();
     auto rawpulses = resync.get_pulses(fin, true);
+    perf.k2_get_pulses_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_k2_pulses_0).count();
+    const auto& k2perf = resync.perf_stats();
+    perf.k2_serration_work_s += k2perf.serration_work_s;
+    perf.k2_add_pulselevels_s += k2perf.add_pulselevels_s;
+    perf.k2_level_apply_s += k2perf.level_apply_s;
+    perf.k2_final_findpulses_s += k2perf.final_findpulses_s;
+    const auto& serrperf = resync.serration_perf_stats();
+    perf.k2_serration_reduce_s += serrperf.work_reduce_s;
+    perf.k2_serration_envelope_s += serrperf.envelope_s;
+    perf.k2_serration_power_ratio_s += serrperf.power_ratio_s;
+    perf.k2_serration_search_eq_s += serrperf.search_eq_s;
     if (debug_dump_this_field && !debug_dump_dir.empty()) {
         maybe_write_bin_vec(debug_dump_dir, "cpp_window_video_resync.f64", fin.demod);
         maybe_write_bin_vec(debug_dump_dir, "cpp_window_video05_resync.f64", fin.demod_05);
@@ -843,6 +890,7 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
     std::vector<vhsdecode_cpp::RawPulse> rawpulses_refine;
     rawpulses_refine.reserve(rawpulses.size());
     for (const auto& p : rawpulses) rawpulses_refine.push_back({p.start, p.len});
+    const auto t_k2_refine_0 = std::chrono::steady_clock::now();
     auto validpulses = vhsdecode_cpp::refine_pulses(
         rawpulses_refine,
         fin.demod_05,
@@ -853,6 +901,8 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
         field_cfg.input.luma.hz_ire,
         static_cast<double>(resync.eq_pulselen()),
         static_cast<double>(resync.long_pulse_max()));
+    perf.k2_refine_pulses_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_k2_refine_0).count();
     out.valid_pulses = static_cast<int>(validpulses.size());
     if (debug_dump_this_field && !debug_dump_dir.empty()) {
         std::ostringstream vpcsv;
@@ -891,7 +941,10 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
     first.fallback_line0loc = -1.0;
     first.fallback_is_first_field = -1;
     first.fallback_is_first_field_confidence = -1;
+    const auto t_k2_first_hsync_0 = std::chrono::steady_clock::now();
     const auto first_res = vhsdecode_cpp::get_first_hsync_loc(first);
+    perf.k2_first_hsync_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_k2_first_hsync_0).count();
     out.has_first_hsync = first_res.has_first_hsync_loc;
     if (debug_dump_this_field && !debug_dump_dir.empty()) {
         nlohmann::json j;
@@ -927,7 +980,7 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
 
     const int proclines = field_cfg.input.luma.outlinecount + field_cfg.input.luma.lineoffset + 10;
     const double line0loc = first_res.line0loc;
-    const double lastline = (static_cast<double>(window->input.size()) - line0loc) / meanlinelen - 1.0;
+    const double lastline = (static_cast<double>(window->video.size()) - line0loc) / meanlinelen - 1.0;
     if (lastline < static_cast<double>(proclines)) {
         out.valid = false;
         out.next_offset = static_cast<int>(std::max(line0loc - (meanlinelen * 20.0), static_cast<double>(rf_linelen_i)));
@@ -939,6 +992,7 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
     std::vector<double> pulse_starts;
     pulse_starts.reserve(validpulses.size());
     for (const auto& p : validpulses) pulse_starts.push_back(static_cast<double>(p.start));
+    const auto t_k2_linelocs0_0 = std::chrono::steady_clock::now();
     auto lineloc0 = vhsdecode_cpp::valid_pulses_to_linelocs(
         pulse_starts,
         static_cast<int>(std::lround(first_res.first_hsync_loc)),
@@ -947,6 +1001,8 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
         0.8,
         proclines,
         1.9);
+    perf.k2_linelocs0_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_k2_linelocs0_0).count();
     std::vector<std::uint8_t> linebad = lineloc0.line_location_errs;
     // LOUD FAITHFUL-PORT NOTE:
     // VHS FieldShared.compute_deriv_error() is intentionally a no-op.
@@ -973,7 +1029,10 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
     refine.ire_30 = ire_to_hz_local(field_cfg.input.luma.ire0, field_cfg.input.luma.hz_ire, 30.0);
     refine.ire_n_65 = ire_to_hz_local(field_cfg.input.luma.ire0, field_cfg.input.luma.hz_ire, -65.0);
     refine.ire_110 = ire_to_hz_local(field_cfg.input.luma.ire0, field_cfg.input.luma.hz_ire, 110.0);
+    const auto t_k2_hsync_refine_0 = std::chrono::steady_clock::now();
     auto linelocs = vhsdecode_cpp::refine_linelocs_hsync(refine, linebad);
+    perf.k2_hsync_refine_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_k2_hsync_refine_0).count();
     if (debug_dump_this_field && !debug_dump_dir.empty()) {
         maybe_write_bin_vec(debug_dump_dir, "cpp_linelocs0.f64", lineloc0.line_locations);
         maybe_write_bin_vec(debug_dump_dir, "cpp_lineloc_errs.u8", lineloc0.line_location_errs);
@@ -1019,26 +1078,40 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
     // upstream even when K1/K2 were otherwise tight.
     auto final_linelocs = linelocs;
     if (phase_result.burst_phase_avg.has_value() && !phase_result.phase_sequence.empty()) {
+        const auto t_k3_burst_0 = std::chrono::steady_clock::now();
         sync_to_burst(
             final_linelocs,
             linebad,
             field_cfg.input.luma.outlinelen,
             *phase_result.burst_phase_avg,
             phase_result.phase_sequence);
+        perf.k3_burst_refine_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_k3_burst_0).count();
     }
     if (debug_dump_this_field && !debug_dump_dir.empty()) {
         maybe_write_bin_vec(debug_dump_dir, "cpp_linelocs3.f64", final_linelocs);
     }
-    fix_badlines(final_linelocs, linelocs, linebad, field_cfg.input.luma.lineoffset);
+    {
+        const auto t_k3_fixbad_0 = std::chrono::steady_clock::now();
+        fix_badlines(final_linelocs, linelocs, linebad, field_cfg.input.luma.lineoffset);
+        perf.k3_fix_badlines_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_k3_fixbad_0).count();
+    }
     if (debug_dump_this_field && !debug_dump_dir.empty()) {
         maybe_write_bin_vec(debug_dump_dir, "cpp_linelocs4.f64", final_linelocs);
     }
-    apply_ntsc_phase_offset(final_linelocs, k1_cfg.freq_hz / 1.0e6);
+    {
+        const auto t_k3_phaseoff_0 = std::chrono::steady_clock::now();
+        apply_ntsc_phase_offset(final_linelocs, k1_cfg.freq_hz / 1.0e6);
+        perf.k3_phase_offset_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_k3_phaseoff_0).count();
+    }
     if (debug_dump_this_field && !debug_dump_dir.empty()) {
         maybe_write_bin_vec(debug_dump_dir, "cpp_linelocs_final.f64", final_linelocs);
     }
 
     auto live_luma_params = field_cfg.input.luma;
+    const auto t_k3_levels_0 = std::chrono::steady_clock::now();
     const auto detected_levels = detect_levels_ntsc(
         fin.demod,
         fin.demod_05,
@@ -1048,6 +1121,8 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
         field_cfg.input.luma.hz_ire,
         field_cfg.input.luma.vsync_ire,
         field_cfg.input.luma.outlinecount);
+    perf.k3_detect_levels_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_k3_levels_0).count();
     if (detected_levels.valid) {
         live_luma_params.ire0 = detected_levels.ire0;
         live_luma_params.hz_ire = detected_levels.hz_ire;
@@ -1078,13 +1153,16 @@ std::optional<DecodedField> decode_field(std::uint64_t start,
     auto chroma_downscaled_final = vhsdecode_cpp::downscale_luma(chroma_scale_final_input).dsout_float;
 
     const auto t_k4_0 = std::chrono::steady_clock::now();
-    auto full_input = field_cfg.input;
-    full_input.luma = luma_input;
-    full_input.luma.linelocs = final_linelocs;
-    full_input.chroma.chroma.assign(chroma_downscaled_final.begin(), chroma_downscaled_final.end());
-    full_input.chroma.phase_sequence = phase_result.phase_sequence;
-    full_input.chroma.burst_phase_avg = phase_result.burst_phase_avg;
-    const auto field_out = vhsdecode_cpp::downscale_ntsc_vhs(full_input);
+    auto chroma_input = field_cfg.input.chroma;
+    chroma_input.chroma.assign(chroma_downscaled_final.begin(), chroma_downscaled_final.end());
+    chroma_input.chroma_heterodyne_ref = &field_cfg.input.chroma.chroma_heterodyne;
+    chroma_input.phase_sequence = std::move(phase_result.phase_sequence);
+    chroma_input.burst_phase_avg = phase_result.burst_phase_avg;
+    vhsdecode_cpp::NtscVhsDownscaleResult field_out{};
+    field_out.luma = vhsdecode_cpp::downscale_luma(luma_input);
+    if (field_cfg.input.write_chroma) {
+        field_out.chroma = vhsdecode_cpp::process_chroma(chroma_input);
+    }
     perf.k4_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_k4_0).count();
 
     out.valid = true;
@@ -1133,7 +1211,7 @@ vhsdecode_cpp::DecodeDriverConfig parse_args(int argc, char** argv) {
             "usage: vhsdecode_ntsc_vhs_decode <input_u8> <output_base> "
             "[--profile ntsc-vhs] [--metadata-json FILE] [--k1-dir DIR] "
             "[--k3-phase-dir DIR] [--k4-dir DIR] [--debug-dump-dir DIR] "
-            "[--debug-capture-seq N] [--max-fields N] [--max-attempts N]");
+            "[--debug-capture-seq N] [--max-fields N] [--max-attempts N] [--threads N]");
     }
     vhsdecode_cpp::DecodeDriverConfig out;
     out.profile = vhsdecode_cpp::DecodeProfile::NtscVhs;
@@ -1156,6 +1234,7 @@ vhsdecode_cpp::DecodeDriverConfig parse_args(int argc, char** argv) {
         else if (arg == "--debug-capture-seq" && i + 1 < argc) out.debug_capture_seq = std::stoi(argv[++i]);
         else if (arg == "--max-fields" && i + 1 < argc) out.max_fields = std::stoi(argv[++i]);
         else if (arg == "--max-attempts" && i + 1 < argc) out.max_attempts = std::stoi(argv[++i]);
+        else if (arg == "--threads" && i + 1 < argc) out.threads = std::stoi(argv[++i]);
         else throw std::runtime_error("unknown argument: " + arg);
     }
     return out;
@@ -1165,14 +1244,92 @@ vhsdecode_cpp::DecodeDriverConfig parse_args(int argc, char** argv) {
 
 namespace vhsdecode_cpp {
 
-DecodeDriverResult run_decode_driver(const DecodeDriverConfig& args) {
-        const auto k1_kv = read_kv(args.k1_dir / "config.kv");
-        const auto k1_cfg = load_k1_config(k1_kv);
-        const std::size_t blockcut = parse_num<std::size_t>(k1_kv, "blockcut");
-        const std::size_t blockcut_end = parse_num<std::size_t>(k1_kv, "blockcut_end");
-        auto k1_ctx = build_k1_context(k1_cfg);
-        const auto phase_cfg = load_phase_config(args.k3_phase_dir);
-        auto field_cfg = load_field_config(args.k4_dir);
+namespace {
+
+struct DecodeChunkConfig {
+    std::uint64_t start_offset = 0;
+    std::optional<std::uint64_t> stop_offset;
+};
+
+struct SharedDecodeContext {
+    K1BuildConfig k1_cfg{};
+    std::size_t blockcut = 0;
+    std::size_t blockcut_end = 0;
+    std::shared_ptr<const K1Context> k1_ctx;
+    std::shared_ptr<const PhaseConfig> phase_cfg;
+    std::shared_ptr<const FieldConfig> field_cfg;
+    ResyncRuntimeConfig rcfg{};
+    std::size_t demod_cache_blocks = 256;
+};
+
+std::size_t compute_parallel_demod_cache_blocks(const K1BuildConfig& k1_cfg,
+                                                std::size_t blockcut,
+                                                std::size_t blockcut_end,
+                                                int num_threads) {
+    if (num_threads <= 1) return 256;
+
+    const std::size_t blocksize = k1_cfg.blocklen - (blockcut + blockcut_end);
+    const std::size_t per_block_bytes =
+        (k1_cfg.blocklen * sizeof(double)) + (blocksize * sizeof(double) * 4U);
+
+    std::size_t blocks_from_l3 = 64;
+    const auto hw = detect_hardware_info();
+    if (hw.l3_cache_bytes.has_value() && *hw.l3_cache_bytes > 0) {
+        const std::size_t total_cache_budget = *hw.l3_cache_bytes * 4U;
+        const std::size_t per_worker_budget = std::max<std::size_t>(
+            total_cache_budget / static_cast<std::size_t>(num_threads), per_block_bytes);
+        blocks_from_l3 = std::max<std::size_t>(1, per_worker_budget / per_block_bytes);
+    }
+
+    std::size_t blocks_from_ram = 256;
+    if (hw.total_ram_bytes.has_value() && *hw.total_ram_bytes > 0) {
+        const std::size_t total_ram_budget = *hw.total_ram_bytes / 8U;
+        const std::size_t per_worker_budget = std::max<std::size_t>(
+            total_ram_budget / static_cast<std::size_t>(num_threads), per_block_bytes);
+        blocks_from_ram = std::max<std::size_t>(1, per_worker_budget / per_block_bytes);
+    }
+
+    const std::size_t min_blocks = 32;
+    const std::size_t max_blocks = 256;
+    return std::clamp(std::min(blocks_from_l3, blocks_from_ram), min_blocks, max_blocks);
+}
+
+SharedDecodeContext build_shared_decode_context(const DecodeDriverConfig& args,
+                                                int num_threads_for_cache) {
+    SharedDecodeContext shared{};
+    const auto k1_kv = read_kv(args.k1_dir / "config.kv");
+    shared.k1_cfg = load_k1_config(k1_kv);
+    shared.blockcut = parse_num<std::size_t>(k1_kv, "blockcut");
+    shared.blockcut_end = parse_num<std::size_t>(k1_kv, "blockcut_end");
+    {
+        std::lock_guard<std::mutex> lock(vhsdecode::cppport::fftw_plan_mutex());
+        shared.k1_ctx = std::make_shared<K1Context>(build_k1_context(shared.k1_cfg));
+    }
+    shared.phase_cfg = std::make_shared<PhaseConfig>(load_phase_config(args.k3_phase_dir));
+    shared.field_cfg = std::make_shared<FieldConfig>(load_field_config(args.k4_dir));
+    shared.rcfg.sample_rate_hz = shared.k1_cfg.freq_hz;
+    shared.rcfg.sample_rate_mhz = shared.k1_cfg.freq_hz / 1.0e6;
+    shared.rcfg.divisor = 1;
+    shared.rcfg.fps = shared.k1_cfg.fps;
+    shared.rcfg.frame_lines = shared.k1_cfg.frame_lines;
+    shared.rcfg.eq_pulse_us = 2.3;
+    shared.rcfg.vsync_pulse_us = 27.1;
+    shared.rcfg.sysparams_const.ire0 = shared.field_cfg->input.luma.ire0;
+    shared.rcfg.sysparams_const.hz_ire = shared.field_cfg->input.luma.hz_ire;
+    shared.rcfg.sysparams_const.vsync_hz = ire_to_hz_local(
+        shared.field_cfg->input.luma.ire0,
+        shared.field_cfg->input.luma.hz_ire,
+        shared.field_cfg->input.luma.vsync_ire);
+    shared.demod_cache_blocks = compute_parallel_demod_cache_blocks(
+        shared.k1_cfg, shared.blockcut, shared.blockcut_end, num_threads_for_cache);
+    return shared;
+}
+
+DecodeDriverResult run_decode_driver_single(const DecodeDriverConfig& args,
+                                            const SharedDecodeContext& shared,
+                                            const DecodeChunkConfig& chunk_cfg) {
+        const auto& k1_cfg = shared.k1_cfg;
+        const std::size_t blockcut = shared.blockcut;
         // LOUD FAITHFUL-PORT NOTE:
         // The saved K3 parity fixture may contain a field-specific `track_phase`
         // value from whatever field produced that artifact. Upstream live decode
@@ -1180,22 +1337,18 @@ DecodeDriverResult run_decode_driver(const DecodeDriverConfig& args) {
         // runtime/default state unless the user explicitly forces `--track_phase`.
         // Leaking a baked fixture value here can flip the live NTSC chroma phase
         // by 180 degrees while leaving the rest of the driver looking healthy.
-        auto live_phase_cfg = phase_cfg;
+        auto live_phase_cfg = *shared.phase_cfg;
+        const auto& field_cfg = *shared.field_cfg;
         live_phase_cfg.input.chroma_rotation_index.reset();
-        vhsdecode_cpp::ResyncRuntimeConfig rcfg{};
-        rcfg.sample_rate_hz = k1_cfg.freq_hz;
-        rcfg.sample_rate_mhz = k1_cfg.freq_hz / 1.0e6;
-        rcfg.divisor = 1;
-        rcfg.fps = k1_cfg.fps;
-        rcfg.frame_lines = k1_cfg.frame_lines;
-        rcfg.eq_pulse_us = 2.3;
-        rcfg.vsync_pulse_us = 27.1;
-        rcfg.sysparams_const.ire0 = field_cfg.input.luma.ire0;
-        rcfg.sysparams_const.hz_ire = field_cfg.input.luma.hz_ire;
-        rcfg.sysparams_const.vsync_hz = ire_to_hz_local(field_cfg.input.luma.ire0, field_cfg.input.luma.hz_ire, field_cfg.input.luma.vsync_ire);
-        vhsdecode_cpp::ResyncRuntime resync(rcfg);
+        vhsdecode_cpp::ResyncRuntime resync(shared.rcfg);
 
-        vhsdecode_cpp::DemodCache reader(args.input_u8, k1_cfg, std::move(k1_ctx), blockcut, blockcut_end);
+        vhsdecode_cpp::DemodCache reader(
+            args.input_u8,
+            k1_cfg,
+            shared.k1_ctx,
+            blockcut,
+            shared.blockcut_end,
+            shared.demod_cache_blocks);
 
         std::ofstream tbc_out(args.output_base.string() + ".tbc", std::ios::binary);
         std::ofstream chroma_out(args.output_base.string() + "_chroma.tbc", std::ios::binary);
@@ -1228,7 +1381,7 @@ DecodeDriverResult run_decode_driver(const DecodeDriverConfig& args) {
             }
         }
 
-        std::uint64_t fdoffset = 0;
+        std::uint64_t fdoffset = chunk_cfg.start_offset;
         int fields_written = 0;
         int fields_seen = 0;
         int attempts = 0;
@@ -1243,6 +1396,9 @@ DecodeDriverResult run_decode_driver(const DecodeDriverConfig& args) {
                 (!guided_starts.empty() && static_cast<std::size_t>(attempts - 1) < guided_starts.size())
                     ? guided_starts[static_cast<std::size_t>(attempts - 1)]
                     : fdoffset;
+            if (guided_starts.empty() && chunk_cfg.stop_offset.has_value() && decode_start >= *chunk_cfg.stop_offset) {
+                break;
+            }
             const auto field = decode_field(
                 decode_start,
                 reader,
@@ -1260,7 +1416,7 @@ DecodeDriverResult run_decode_driver(const DecodeDriverConfig& args) {
                     attempts == args.debug_capture_seq);
             if (!field.has_value()) break;
             if (!field->valid) {
-                if (attempts <= 10 || (attempts % 25) == 0) {
+                if (args.verbose && (attempts <= 10 || (attempts % 25) == 0)) {
                     std::cerr << "attempt=" << attempts
                               << " readloc=" << decode_start
                               << " raw_pulses=" << field->raw_pulses
@@ -1281,7 +1437,7 @@ DecodeDriverResult run_decode_driver(const DecodeDriverConfig& args) {
             }
 
             ++fields_seen;
-            if (fields_seen <= 10 || (fields_seen % 25) == 0) {
+            if (args.verbose && (fields_seen <= 10 || (fields_seen % 25) == 0)) {
                 std::cerr << "field=" << fields_seen
                           << " attempts=" << attempts
                           << " readloc=" << field->readloc
@@ -1309,7 +1465,7 @@ DecodeDriverResult run_decode_driver(const DecodeDriverConfig& args) {
             const auto mo = vhsdecode_cpp::build_metadata(mi, meta_state);
             const auto fi = metadata_json_from(mo);
 
-            if (field->readloc >= 137000000ULL && field->readloc <= 141500000ULL) {
+            if (args.verbose && field->readloc >= 137000000ULL && field->readloc <= 141500000ULL) {
                 std::cerr << "meta readloc=" << field->readloc
                           << " in_is_first=" << (field->is_first_field ? 1 : 0)
                           << " sync_conf=" << field->sync_conf
@@ -1507,14 +1663,255 @@ DecodeDriverResult run_decode_driver(const DecodeDriverConfig& args) {
         result.elapsed_s = elapsed;
         result.throughput_fields_per_s = fps_fields;
         result.throughput_frames_per_s = fps_frames;
-        std::cerr << std::fixed << std::setprecision(6)
-                  << "perf read_s=" << perf.read_s
-                  << " k2_s=" << perf.k2_s
-                  << " k3_s=" << perf.k3_s
-                  << " k4_s=" << perf.k4_s
-                  << " write_s=" << perf.write_s
-                  << "\n";
+        if (args.verbose) {
+            std::cerr << std::fixed << std::setprecision(6)
+                      << "perf read_s=" << perf.read_s
+                      << " k2_s=" << perf.k2_s
+                      << " k2_get_pulses_s=" << perf.k2_get_pulses_s
+                      << " k2_serration_work_s=" << perf.k2_serration_work_s
+                      << " k2_serration_reduce_s=" << perf.k2_serration_reduce_s
+                      << " k2_serration_envelope_s=" << perf.k2_serration_envelope_s
+                      << " k2_serration_power_ratio_s=" << perf.k2_serration_power_ratio_s
+                      << " k2_serration_search_eq_s=" << perf.k2_serration_search_eq_s
+                      << " k2_add_pulselevels_s=" << perf.k2_add_pulselevels_s
+                      << " k2_level_apply_s=" << perf.k2_level_apply_s
+                      << " k2_final_findpulses_s=" << perf.k2_final_findpulses_s
+                      << " k2_refine_pulses_s=" << perf.k2_refine_pulses_s
+                      << " k2_first_hsync_s=" << perf.k2_first_hsync_s
+                      << " k2_linelocs0_s=" << perf.k2_linelocs0_s
+                      << " k2_hsync_refine_s=" << perf.k2_hsync_refine_s
+                      << " k3_s=" << perf.k3_s
+                      << " k4_s=" << perf.k4_s
+                      << " k4_luma_s=" << perf.k4_luma_s
+                      << " k4_chroma_s=" << perf.k4_chroma_s
+                      << " k4_chroma_cafc_prefilter_s=" << perf.k4_chroma_cafc_prefilter_s
+                      << " k4_chroma_burst_deemph_s=" << perf.k4_chroma_burst_deemph_s
+                      << " k4_chroma_upconvert_s=" << perf.k4_chroma_upconvert_s
+                      << " k4_chroma_phase_comp_s=" << perf.k4_chroma_phase_comp_s
+                      << " k4_chroma_final_filter_s=" << perf.k4_chroma_final_filter_s
+                      << " k4_chroma_deemph_s=" << perf.k4_chroma_deemph_s
+                      << " k4_chroma_comb_s=" << perf.k4_chroma_comb_s
+                      << " k4_chroma_acc_s=" << perf.k4_chroma_acc_s
+                      << " k4_chroma_to_u16_s=" << perf.k4_chroma_to_u16_s
+                      << " write_s=" << perf.write_s
+                      << "\n";
+        }
         return result;
+}
+
+struct WorkerChunk {
+    int worker_id = 0;
+    std::uint64_t owned_start = 0;
+    std::uint64_t owned_end = 0;
+    std::uint64_t decode_start = 0;
+    std::uint64_t decode_stop = 0;
+    fs::path output_base;
+    DecodeDriverResult result;
+    std::exception_ptr error;
+};
+
+}  // namespace
+
+DecodeDriverResult run_decode_driver(const DecodeDriverConfig& args) {
+    const auto k1_kv = read_kv(args.k1_dir / "config.kv");
+    const auto k1_cfg_probe = load_k1_config(k1_kv);
+    if (args.threads <= 1) {
+        return run_decode_driver_single(args, build_shared_decode_context(args, 1), {});
+    }
+
+    const std::uint64_t total_samples = fs::file_size(args.input_u8);
+    const std::uint64_t samples_per_field =
+        static_cast<std::uint64_t>(std::llround(k1_cfg_probe.freq_hz / (k1_cfg_probe.fps * 2.0)));
+    int num_threads = std::max(1, args.threads);
+    const int est_fields = static_cast<int>(total_samples / std::max<std::uint64_t>(1, samples_per_field));
+    if (est_fields < num_threads * 8) {
+        num_threads = std::max(1, est_fields / 8);
+    }
+    if (num_threads <= 1) {
+        return run_decode_driver_single(args, build_shared_decode_context(args, 1), {});
+    }
+    auto shared = build_shared_decode_context(args, num_threads);
+    const auto& k1_cfg = shared.k1_cfg;
+    const std::uint64_t overlap_fields = std::min<std::uint64_t>(
+        40, std::max<std::uint64_t>(8, static_cast<std::uint64_t>(est_fields / (num_threads * 4))));
+    const std::uint64_t overlap = samples_per_field * overlap_fields;
+
+    auto align_up = [samples_per_field](std::uint64_t v) {
+        if (samples_per_field == 0) return v;
+        const auto rem = v % samples_per_field;
+        return rem == 0 ? v : (v + samples_per_field - rem);
+    };
+
+    const std::uint64_t nominal_chunk = align_up(total_samples / static_cast<std::uint64_t>(num_threads));
+    std::vector<WorkerChunk> chunks(static_cast<std::size_t>(num_threads));
+    std::uint64_t cursor = 0;
+    for (int i = 0; i < num_threads; ++i) {
+        auto& chunk = chunks[static_cast<std::size_t>(i)];
+        chunk.worker_id = i;
+        chunk.owned_start = cursor;
+        chunk.owned_end = (i == num_threads - 1) ? total_samples : std::min(total_samples, align_up(cursor + nominal_chunk));
+        chunk.decode_start = (chunk.owned_start > overlap) ? (chunk.owned_start - overlap) : 0;
+        chunk.decode_stop = std::min(total_samples, chunk.owned_end + overlap);
+        chunk.output_base = fs::path(args.output_base.string() + ".worker" + std::to_string(i));
+        cursor = chunk.owned_end;
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(chunks.size());
+    for (auto& chunk : chunks) {
+        workers.emplace_back([&args, &shared, &chunk]() {
+            try {
+                auto worker_args = args;
+                worker_args.output_base = chunk.output_base;
+                worker_args.debug_dump_dir.clear();
+                worker_args.metadata_json.clear();
+                worker_args.threads = 1;
+                worker_args.verbose = false;
+                chunk.result = run_decode_driver_single(
+                    worker_args,
+                    shared,
+                    DecodeChunkConfig{chunk.decode_start, chunk.decode_stop});
+            } catch (...) {
+                chunk.error = std::current_exception();
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    for (const auto& chunk : chunks) {
+        if (chunk.error) std::rethrow_exception(chunk.error);
+    }
+
+    struct MergedField {
+        std::uint64_t file_loc = 0;
+        fs::path base;
+        std::size_t local_index = 0;
+        nlohmann::json field_json;
+    };
+
+    std::vector<MergedField> merged;
+    nlohmann::json template_json;
+    std::size_t field_bytes = 0;
+    std::vector<nlohmann::json> chunk_jsons(chunks.size());
+    std::vector<int> phase_adjust(chunks.size(), 0);
+    for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
+        const auto& chunk = chunks[ci];
+        std::ifstream jin(chunk.output_base.string() + ".tbc.json");
+        if (!jin.is_open()) {
+            throw std::runtime_error("failed to open worker json: " + chunk.output_base.string());
+        }
+        nlohmann::json j;
+        jin >> j;
+        chunk_jsons[ci] = j;
+        if (ci == 0) template_json = j;
+        const auto& fields = chunk_jsons[ci].at("fields");
+        if (field_bytes == 0 && !fields.empty()) {
+            const auto tbc_size = fs::file_size(chunk.output_base.string() + ".tbc");
+            field_bytes = static_cast<std::size_t>(tbc_size / fields.size());
+        }
+    }
+
+    for (std::size_t ci = 1; ci < chunks.size(); ++ci) {
+        const auto& prev_fields = chunk_jsons[ci - 1].at("fields");
+        const auto& curr_fields = chunk_jsons[ci].at("fields");
+        std::unordered_map<std::uint64_t, int> prev_phase_by_loc;
+        prev_phase_by_loc.reserve(prev_fields.size());
+        for (const auto& f : prev_fields) {
+            const int prev_phase = f.at("fieldPhaseID").get<int>();
+            const int adjusted_prev_phase = ((prev_phase - 1 + phase_adjust[ci - 1]) % 4) + 1;
+            prev_phase_by_loc.emplace(static_cast<std::uint64_t>(f.at("fileLoc").get<int>()),
+                                      adjusted_prev_phase);
+        }
+        for (const auto& f : curr_fields) {
+            const auto file_loc = static_cast<std::uint64_t>(f.at("fileLoc").get<int>());
+            const auto it = prev_phase_by_loc.find(file_loc);
+            if (it == prev_phase_by_loc.end()) continue;
+            const int curr_phase = f.at("fieldPhaseID").get<int>();
+            phase_adjust[ci] = ((it->second - curr_phase) % 4 + 4) % 4;
+            break;
+        }
+    }
+
+    for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
+        const auto& chunk = chunks[ci];
+        const auto& fields = chunk_jsons[ci].at("fields");
+        for (std::size_t i = 0; i < fields.size(); ++i) {
+            auto f = fields.at(i);
+            const auto file_loc = static_cast<std::uint64_t>(f.at("fileLoc").get<int>());
+            const bool keep = (ci + 1U == chunks.size())
+                ? (file_loc >= chunk.owned_start)
+                : (file_loc >= chunk.owned_start && file_loc < chunk.owned_end);
+            if (!keep) continue;
+            if (phase_adjust[ci] != 0 && f.contains("fieldPhaseID")) {
+                const int phase = f.at("fieldPhaseID").get<int>();
+                f["fieldPhaseID"] = ((phase - 1 + phase_adjust[ci]) % 4) + 1;
+            }
+            merged.push_back(MergedField{file_loc, chunk.output_base, i, f});
+        }
+    }
+
+    std::sort(merged.begin(), merged.end(),
+              [](const MergedField& a, const MergedField& b) {
+                  if (a.file_loc != b.file_loc) return a.file_loc < b.file_loc;
+                  return a.local_index < b.local_index;
+              });
+
+    std::ofstream out_tbc(args.output_base.string() + ".tbc", std::ios::binary);
+    std::ofstream out_chroma(args.output_base.string() + "_chroma.tbc", std::ios::binary);
+    if (!out_tbc.is_open() || !out_chroma.is_open()) {
+        throw std::runtime_error("failed to open merged output files");
+    }
+
+    std::vector<char> field_buf(field_bytes);
+    std::vector<nlohmann::json> merged_fields_json;
+    merged_fields_json.reserve(merged.size());
+    std::map<std::string, std::ifstream> tbc_inputs;
+    std::map<std::string, std::ifstream> chroma_inputs;
+    for (std::size_t i = 0; i < merged.size(); ++i) {
+        auto field_json = merged[i].field_json;
+        field_json["seqNo"] = static_cast<int>(i + 1);
+        merged_fields_json.push_back(field_json);
+
+        auto& tin = tbc_inputs[merged[i].base.string()];
+        if (!tin.is_open()) tin.open(merged[i].base.string() + ".tbc", std::ios::binary);
+        auto& cin = chroma_inputs[merged[i].base.string()];
+        if (!cin.is_open()) cin.open(merged[i].base.string() + "_chroma.tbc", std::ios::binary);
+        const auto off = static_cast<std::streamoff>(merged[i].local_index * field_bytes);
+        tin.seekg(off, std::ios::beg);
+        tin.read(field_buf.data(), static_cast<std::streamsize>(field_bytes));
+        out_tbc.write(field_buf.data(), static_cast<std::streamsize>(field_bytes));
+        cin.seekg(off, std::ios::beg);
+        cin.read(field_buf.data(), static_cast<std::streamsize>(field_bytes));
+        out_chroma.write(field_buf.data(), static_cast<std::streamsize>(field_bytes));
+    }
+
+    template_json["fields"] = merged_fields_json;
+    template_json["videoParameters"]["numberOfSequentialFields"] = static_cast<int>(merged_fields_json.size());
+    std::ofstream jout(args.output_base.string() + ".tbc.json");
+    jout << std::setw(2) << template_json << "\n";
+
+    for (const auto& chunk : chunks) {
+        std::error_code ec;
+        fs::remove(chunk.output_base.string() + ".tbc", ec);
+        fs::remove(chunk.output_base.string() + "_chroma.tbc", ec);
+        fs::remove(chunk.output_base.string() + ".tbc.json", ec);
+        fs::remove(chunk.output_base.string() + ".firstfield.linelocs.f64", ec);
+        fs::remove(chunk.output_base.string() + ".firstfield.linebad.u8", ec);
+    }
+
+    DecodeDriverResult merged_result{};
+    merged_result.input = args.input_u8.string();
+    merged_result.output_base = args.output_base.string();
+    for (const auto& chunk : chunks) {
+        merged_result.fields_seen += chunk.result.fields_seen;
+        merged_result.attempts += chunk.result.attempts;
+        merged_result.elapsed_s = std::max(merged_result.elapsed_s, chunk.result.elapsed_s);
+    }
+    merged_result.fields_written = static_cast<int>(merged_fields_json.size());
+    merged_result.throughput_fields_per_s =
+        merged_result.elapsed_s > 0.0 ? static_cast<double>(merged_result.fields_written) / merged_result.elapsed_s : 0.0;
+    merged_result.throughput_frames_per_s =
+        merged_result.elapsed_s > 0.0 ? (static_cast<double>(merged_result.fields_written) / 2.0) / merged_result.elapsed_s : 0.0;
+    return merged_result;
 }
 
 }  // namespace vhsdecode_cpp

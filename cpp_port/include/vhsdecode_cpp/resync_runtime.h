@@ -28,11 +28,26 @@ struct ResyncFieldInput {
     bool disable_dc_offset = false;
 };
 
+struct ResyncPerfStats {
+    double serration_work_s = 0.0;
+    double add_pulselevels_s = 0.0;
+    double level_apply_s = 0.0;
+    double final_findpulses_s = 0.0;
+};
+
 class ResyncRuntime {
 public:
     explicit ResyncRuntime(const ResyncRuntimeConfig& config);
 
     std::vector<Pulse> get_pulses(ResyncFieldInput& field, bool check_levels = true);
+    const ResyncPerfStats& perf_stats() const { return perf_stats_; }
+    void reset_perf_stats() {
+        perf_stats_ = {};
+        vsync_serration_.reset_perf_stats();
+    }
+    const vhsdecode::cppport::VsyncPerfStats& serration_perf_stats() const {
+        return vsync_serration_.perf_stats();
+    }
 
     int eq_pulselen() const { return eq_pulselen_; }
     int linelen() const { return linelen_; }
@@ -76,6 +91,11 @@ private:
     int long_pulse_max_ = 0;
     double last_pulse_threshold_ = 0.0;
     bool use_serration_ = true;
+    ResyncPerfStats perf_stats_{};
+    std::vector<double> reduced_sync_work_;
+    std::vector<int> pulse_starts_work_;
+    std::vector<int> pulse_lengths_work_;
+    std::vector<Pulse> pulses_work_;
 };
 
 }  // namespace vhsdecode_cpp

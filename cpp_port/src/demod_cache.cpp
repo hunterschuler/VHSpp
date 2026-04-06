@@ -17,7 +17,7 @@ void append_vec(std::vector<double>& dst, const std::vector<double>& src) {
 
 DemodCache::DemodCache(const std::filesystem::path& raw_path,
                        const K1BuildConfig& cfg,
-                       K1Context ctx,
+                       std::shared_ptr<const K1Context> ctx,
                        std::size_t blockcut,
                        std::size_t blockcut_end,
                        std::size_t cache_size)
@@ -41,11 +41,12 @@ void DemodCache::lru_touch(std::vector<std::uint64_t>& lru, std::uint64_t key) {
 }
 
 void DemodCache::prune_cache() {
-    if (lru_.size() <= cache_size_) return;
-    for (std::size_t i = cache_size_; i < lru_.size(); ++i) {
+    const std::size_t keep_blocks = std::max(cache_size_, transient_keep_blocks_);
+    if (lru_.size() <= keep_blocks) return;
+    for (std::size_t i = keep_blocks; i < lru_.size(); ++i) {
         blocks_.erase(lru_[i]);
     }
-    lru_.resize(cache_size_);
+    lru_.resize(keep_blocks);
 }
 
 bool DemodCache::load_raw_block(std::uint64_t blocknum) {
@@ -90,10 +91,8 @@ bool DemodCache::ensure_demod_block(std::uint64_t blocknum, bool force_redo) {
     // ctx_.state across blocks here introduced a live-only luma DC/blanking
     // shift that did not show up in isolated kernel parity work.
     auto state = DemodBlockState{};
-    const auto result = demodblock(input, ctx_.filters, ctx_.options, cfg_.freq_hz, &state);
+    const auto result = demodblock(input, ctx_->filters, ctx_->options, cfg_.freq_hz, &state);
 
-    block.input.assign(result.data.begin() + static_cast<std::ptrdiff_t>(blockcut_),
-                       result.data.end() - static_cast<std::ptrdiff_t>(blockcut_end_));
     block.video.assign(result.out_video.begin() + static_cast<std::ptrdiff_t>(blockcut_),
                        result.out_video.end() - static_cast<std::ptrdiff_t>(blockcut_end_));
     block.video_05.assign(result.out_video05.begin() + static_cast<std::ptrdiff_t>(blockcut_),
@@ -105,27 +104,52 @@ bool DemodCache::ensure_demod_block(std::uint64_t blocknum, bool force_redo) {
     return true;
 }
 
+void DemodCache::ensure_input_block(BlockEntry& block) {
+    if (!block.input.empty()) return;
+
+    DemodBlockInput input{};
+    input.data = block.rawinput;
+    auto state = DemodBlockState{};
+    const auto result = demodblock(input, ctx_->filters, ctx_->options, cfg_.freq_hz, &state);
+    block.input.assign(result.data.begin() + static_cast<std::ptrdiff_t>(blockcut_),
+                       result.data.end() - static_cast<std::ptrdiff_t>(blockcut_end_));
+}
+
 std::optional<DemodCacheReadResult> DemodCache::read(std::uint64_t begin,
                                                      std::uint64_t length,
-                                                     bool force_redo) {
+                                                     bool force_redo,
+                                                     bool include_input) {
     if (begin >= file_size_) return std::nullopt;
     const std::uint64_t end = begin + length;
     const std::uint64_t first_block = begin / blocksize_;
     const std::uint64_t last_block = end / blocksize_;
+    const std::size_t block_count =
+        static_cast<std::size_t>((last_block - first_block) + 1ULL);
+    transient_keep_blocks_ = block_count;
 
     for (std::uint64_t b = first_block; b <= last_block; ++b) {
-        if (!ensure_demod_block(b, force_redo)) return std::nullopt;
+        if (!ensure_demod_block(b, force_redo)) {
+            transient_keep_blocks_ = 0;
+            return std::nullopt;
+        }
     }
 
     DemodCacheReadResult out;
+    const std::size_t reserve_len = block_count * blocksize_;
+    if (include_input) out.input.reserve(reserve_len);
+    out.video.reserve(reserve_len);
+    out.video_05.reserve(reserve_len);
+    out.chroma.reserve(reserve_len);
     for (std::uint64_t b = first_block; b <= last_block; ++b) {
-        const auto& block = blocks_.at(b);
-        append_vec(out.input, block.input);
+        auto& block = blocks_.at(b);
+        if (include_input) ensure_input_block(block);
+        if (include_input) append_vec(out.input, block.input);
         append_vec(out.video, block.video);
         append_vec(out.video_05, block.video_05);
         append_vec(out.chroma, block.chroma);
     }
     out.startloc = first_block * blocksize_;
+    transient_keep_blocks_ = 0;
     prune_cache();
     return out;
 }

@@ -1,4 +1,5 @@
 #include "vhsdecode_cpp/chroma_process.h"
+#include "vhsdecode_cpp/fftw_guard.h"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,113 @@ using vhsdecode::cppport::SosSection;
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kS16AbsMax = 32767.0;
+constexpr bool kEnableDetailedChromaPerf = false;
+
+struct ComplexFftPlanCache {
+    int n = 0;
+    fftw_complex* in = nullptr;
+    fftw_complex* out = nullptr;
+    fftw_plan plan = nullptr;
+
+    ~ComplexFftPlanCache() {
+        if (plan) fftw_destroy_plan(plan);
+        if (in) fftw_free(in);
+        if (out) fftw_free(out);
+    }
+
+    void ensure(int wanted_n, int direction) {
+        if (plan != nullptr && wanted_n == n) return;
+        if (plan) fftw_destroy_plan(plan);
+        if (in) fftw_free(in);
+        if (out) fftw_free(out);
+        n = wanted_n;
+        in = reinterpret_cast<fftw_complex*>(
+            fftw_malloc(sizeof(fftw_complex) * static_cast<std::size_t>(n)));
+        out = reinterpret_cast<fftw_complex*>(
+            fftw_malloc(sizeof(fftw_complex) * static_cast<std::size_t>(n)));
+        if (!(in && out)) throw std::runtime_error("fftw alloc failed");
+        std::lock_guard<std::mutex> lock(vhsdecode::cppport::fftw_plan_mutex());
+        plan = fftw_plan_dft_1d(n, in, out, direction, FFTW_ESTIMATE);
+        if (plan == nullptr) throw std::runtime_error("fftw plan failed");
+    }
+};
+
+struct HilbertMaskCache {
+    std::size_t n = 0;
+    std::vector<double> h;
+
+    void ensure(std::size_t wanted_n) {
+        if (wanted_n == n) return;
+        n = wanted_n;
+        h.assign(n, 0.0);
+        if (n == 0) return;
+        h[0] = 1.0;
+        if ((n % 2U) == 0U) {
+            h[n / 2] = 1.0;
+            for (std::size_t i = 1; i < n / 2; ++i) h[i] = 2.0;
+        } else {
+            for (std::size_t i = 1; i <= n / 2; ++i) h[i] = 2.0;
+        }
+    }
+};
+
+std::array<double, 2> sos_section_zi_cpp(const SosSection& sec);
+
+struct SosSectionRuntime {
+    double b0 = 0.0;
+    double b1 = 0.0;
+    double b2 = 0.0;
+    double a1 = 0.0;
+    double a2 = 0.0;
+    double dc_scale = 1.0;
+    std::array<double, 2> zi_base = {0.0, 0.0};
+};
+
+struct SosRuntimeCache {
+    SosFilter filter;
+    std::vector<SosSectionRuntime> sections;
+    std::size_t ntaps = 0;
+    bool valid = false;
+
+    static bool same_filter(const SosFilter& lhs, const SosFilter& rhs) {
+        if (lhs.sections.size() != rhs.sections.size()) return false;
+        for (std::size_t i = 0; i < lhs.sections.size(); ++i) {
+            const auto& a = lhs.sections[i];
+            const auto& b = rhs.sections[i];
+            if (a.b0 != b.b0 || a.b1 != b.b1 || a.b2 != b.b2 ||
+                a.a0 != b.a0 || a.a1 != b.a1 || a.a2 != b.a2) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void ensure(const SosFilter& wanted) {
+        if (valid && same_filter(filter, wanted)) return;
+        filter = wanted;
+        sections.clear();
+        sections.reserve(filter.sections.size());
+        const std::size_t zeros_b2 = std::count_if(filter.sections.begin(), filter.sections.end(),
+                                                   [](const SosSection& sec) { return sec.b2 == 0.0; });
+        const std::size_t zeros_a2 = std::count_if(filter.sections.begin(), filter.sections.end(),
+                                                   [](const SosSection& sec) { return sec.a2 == 0.0; });
+        ntaps = (2 * filter.sections.size()) + 1;
+        ntaps -= std::min(zeros_b2, zeros_a2);
+        for (const auto& sec : filter.sections) {
+            const double a0 = (sec.a0 == 0.0) ? 1.0 : sec.a0;
+            SosSectionRuntime rt{};
+            rt.b0 = sec.b0 / a0;
+            rt.b1 = sec.b1 / a0;
+            rt.b2 = sec.b2 / a0;
+            rt.a1 = sec.a1 / a0;
+            rt.a2 = sec.a2 / a0;
+            rt.dc_scale = (rt.b0 + rt.b1 + rt.b2) / (1.0 + rt.a1 + rt.a2);
+            rt.zi_base = sos_section_zi_cpp(sec);
+            sections.push_back(rt);
+        }
+        valid = true;
+    }
+};
 
 void require(bool cond, const char* msg) {
     if (!cond) throw std::runtime_error(msg);
@@ -197,49 +305,36 @@ std::array<double, 2> sos_section_zi_cpp(const SosSection& sec) {
 }
 
 std::vector<double> sosfiltfilt_cpp(const SosFilter& filter, const std::vector<double>& input) {
-    const std::size_t n_sections = filter.sections.size();
-    const std::size_t zeros_b2 = std::count_if(filter.sections.begin(), filter.sections.end(),
-                                               [](const SosSection& sec) { return sec.b2 == 0.0; });
-    const std::size_t zeros_a2 = std::count_if(filter.sections.begin(), filter.sections.end(),
-                                               [](const SosSection& sec) { return sec.a2 == 0.0; });
-    std::size_t ntaps = (2 * n_sections) + 1;
-    ntaps -= std::min(zeros_b2, zeros_a2);
     if (input.size() <= 1) return input;
-    std::size_t edge = std::min<std::size_t>(3 * ntaps, input.size() - 1);
+    thread_local SosRuntimeCache cache;
+    cache.ensure(filter);
+    std::size_t edge = std::min<std::size_t>(3 * cache.ntaps, input.size() - 1);
     const std::vector<double> ext = odd_ext(input, edge);
     std::vector<double> y = ext;
     double scale = 1.0;
     const double forward_x0 = y.front();
-    for (const auto& sec : filter.sections) {
-        const auto zi_base = sos_section_zi_cpp(sec);
-        std::array<double, 2> zi = {zi_base[0] * forward_x0 * scale, zi_base[1] * forward_x0 * scale};
-        const double a0 = (sec.a0 == 0.0) ? 1.0 : sec.a0;
-        const double b0 = sec.b0 / a0, b1 = sec.b1 / a0, b2 = sec.b2 / a0;
-        const double a1 = sec.a1 / a0, a2 = sec.a2 / a0;
+    for (const auto& sec : cache.sections) {
+        std::array<double, 2> zi = {sec.zi_base[0] * forward_x0 * scale, sec.zi_base[1] * forward_x0 * scale};
         for (double& x : y) {
-            const double outv = b0 * x + zi[0];
-            zi[0] = b1 * x - a1 * outv + zi[1];
-            zi[1] = b2 * x - a2 * outv;
+            const double outv = sec.b0 * x + zi[0];
+            zi[0] = sec.b1 * x - sec.a1 * outv + zi[1];
+            zi[1] = sec.b2 * x - sec.a2 * outv;
             x = outv;
         }
-        scale *= (b0 + b1 + b2) / (1.0 + a1 + a2);
+        scale *= sec.dc_scale;
     }
     std::reverse(y.begin(), y.end());
     scale = 1.0;
     const double reverse_x0 = y.front();
-    for (const auto& sec : filter.sections) {
-        const auto zi_base = sos_section_zi_cpp(sec);
-        std::array<double, 2> zi = {zi_base[0] * reverse_x0 * scale, zi_base[1] * reverse_x0 * scale};
-        const double a0 = (sec.a0 == 0.0) ? 1.0 : sec.a0;
-        const double b0 = sec.b0 / a0, b1 = sec.b1 / a0, b2 = sec.b2 / a0;
-        const double a1 = sec.a1 / a0, a2 = sec.a2 / a0;
+    for (const auto& sec : cache.sections) {
+        std::array<double, 2> zi = {sec.zi_base[0] * reverse_x0 * scale, sec.zi_base[1] * reverse_x0 * scale};
         for (double& x : y) {
-            const double outv = b0 * x + zi[0];
-            zi[0] = b1 * x - a1 * outv + zi[1];
-            zi[1] = b2 * x - a2 * outv;
+            const double outv = sec.b0 * x + zi[0];
+            zi[0] = sec.b1 * x - sec.a1 * outv + zi[1];
+            zi[1] = sec.b2 * x - sec.a2 * outv;
             x = outv;
         }
-        scale *= (b0 + b1 + b2) / (1.0 + a1 + a2);
+        scale *= sec.dc_scale;
     }
     std::reverse(y.begin(), y.end());
     if (edge == 0) return y;
@@ -250,60 +345,41 @@ std::vector<double> sosfiltfilt_cpp(const SosFilter& filter, const std::vector<d
 std::vector<std::complex<double>> fft_complex_full(const std::vector<std::complex<double>>& input) {
     const int n = static_cast<int>(input.size());
     std::vector<std::complex<double>> output(input.size());
-    auto* in = reinterpret_cast<fftw_complex*>(fftw_malloc(sizeof(fftw_complex) * static_cast<std::size_t>(n)));
-    auto* out = reinterpret_cast<fftw_complex*>(fftw_malloc(sizeof(fftw_complex) * static_cast<std::size_t>(n)));
-    require(in && out, "fftw alloc failed");
+    thread_local ComplexFftPlanCache cache;
+    cache.ensure(n, FFTW_FORWARD);
     for (int i = 0; i < n; ++i) {
-        in[i][0] = input[static_cast<std::size_t>(i)].real();
-        in[i][1] = input[static_cast<std::size_t>(i)].imag();
+        cache.in[i][0] = input[static_cast<std::size_t>(i)].real();
+        cache.in[i][1] = input[static_cast<std::size_t>(i)].imag();
     }
-    fftw_plan plan = fftw_plan_dft_1d(n, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
-    require(plan != nullptr, "fftw plan failed");
-    fftw_execute(plan);
-    for (int i = 0; i < n; ++i) output[static_cast<std::size_t>(i)] = {out[i][0], out[i][1]};
-    fftw_destroy_plan(plan);
-    fftw_free(in);
-    fftw_free(out);
+    fftw_execute(cache.plan);
+    for (int i = 0; i < n; ++i) output[static_cast<std::size_t>(i)] = {cache.out[i][0], cache.out[i][1]};
     return output;
 }
 
 std::vector<std::complex<double>> ifft_complex_full(const std::vector<std::complex<double>>& input) {
     const int n = static_cast<int>(input.size());
     std::vector<std::complex<double>> output(input.size());
-    auto* in = reinterpret_cast<fftw_complex*>(fftw_malloc(sizeof(fftw_complex) * static_cast<std::size_t>(n)));
-    auto* out = reinterpret_cast<fftw_complex*>(fftw_malloc(sizeof(fftw_complex) * static_cast<std::size_t>(n)));
-    require(in && out, "fftw alloc failed");
+    thread_local ComplexFftPlanCache cache;
+    cache.ensure(n, FFTW_BACKWARD);
     for (int i = 0; i < n; ++i) {
-        in[i][0] = input[static_cast<std::size_t>(i)].real();
-        in[i][1] = input[static_cast<std::size_t>(i)].imag();
+        cache.in[i][0] = input[static_cast<std::size_t>(i)].real();
+        cache.in[i][1] = input[static_cast<std::size_t>(i)].imag();
     }
-    fftw_plan plan = fftw_plan_dft_1d(n, in, out, FFTW_BACKWARD, FFTW_ESTIMATE);
-    require(plan != nullptr, "fftw plan failed");
-    fftw_execute(plan);
+    fftw_execute(cache.plan);
     const double inv_n = 1.0 / static_cast<double>(n);
-    for (int i = 0; i < n; ++i) output[static_cast<std::size_t>(i)] = {out[i][0] * inv_n, out[i][1] * inv_n};
-    fftw_destroy_plan(plan);
-    fftw_free(in);
-    fftw_free(out);
+    for (int i = 0; i < n; ++i) output[static_cast<std::size_t>(i)] = {cache.out[i][0] * inv_n, cache.out[i][1] * inv_n};
     return output;
 }
 
 std::vector<std::complex<double>> analytic_signal_cpp(const std::vector<double>& signal) {
     const std::size_t n = signal.size();
+    if (n == 0) return {};
     std::vector<std::complex<double>> real_signal(n);
     for (std::size_t i = 0; i < n; ++i) real_signal[i] = {signal[i], 0.0};
     auto spectrum = fft_complex_full(real_signal);
-    std::vector<double> h(n, 0.0);
-    if (n == 0) return {};
-    if ((n % 2U) == 0U) {
-        h[0] = 1.0;
-        h[n / 2] = 1.0;
-        for (std::size_t i = 1; i < n / 2; ++i) h[i] = 2.0;
-    } else {
-        h[0] = 1.0;
-        for (std::size_t i = 1; i <= n / 2; ++i) h[i] = 2.0;
-    }
-    for (std::size_t i = 0; i < n; ++i) spectrum[i] *= h[i];
+    thread_local HilbertMaskCache mask_cache;
+    mask_cache.ensure(n);
+    for (std::size_t i = 0; i < n; ++i) spectrum[i] *= mask_cache.h[i];
     return ifft_complex_full(spectrum);
 }
 
@@ -431,74 +507,158 @@ ChromaProcessResult process_chroma(const ChromaProcessInput& input) {
     // Upstream format coverage is much wider; see LOGBOOK.md before assuming PAL,
     // MPAL, NLINHA, MESECAM, 405/819, Betamax, Video8, U-matic, Type C/B, etc.
     // are validated just because the code compiles here.
-    result.chroma_after_cafc_prefilter = input.chroma;
+    std::vector<double> chroma_after_cafc_prefilter = input.chroma;
     if (input.do_cafc) {
+        const auto t0 = kEnableDetailedChromaPerf ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
         require(input.cafc_chroma_bandpass.has_value(), "do_cafc requires cafc_chroma_bandpass");
-        result.chroma_after_cafc_prefilter = demod_chroma_filt_cpp_local(
-            result.chroma_after_cafc_prefilter,
+        chroma_after_cafc_prefilter = demod_chroma_filt_cpp_local(
+            chroma_after_cafc_prefilter,
             *input.cafc_chroma_bandpass,
-            result.chroma_after_cafc_prefilter.size(),
+            chroma_after_cafc_prefilter.size(),
             input.fvideo_notch,
             input.enable_video_notch,
             input.cafc_move,
             input.chroma_audio_notch);
         if (!input.disable_tracking_cafc) {
             require(input.chroma_afc != nullptr, "tracking CAFC requires chroma_afc");
-            result.cafc_measurement = input.chroma_afc->freqOffset(result.chroma_after_cafc_prefilter);
+            result.cafc_measurement = input.chroma_afc->freqOffset(chroma_after_cafc_prefilter);
+        }
+        if constexpr (kEnableDetailedChromaPerf) {
+            result.perf.cafc_prefilter_s +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         }
     }
+    if (input.keep_intermediates) result.chroma_after_cafc_prefilter = chroma_after_cafc_prefilter;
 
-    result.chroma_after_burst_deemph = result.chroma_after_cafc_prefilter;
+    std::vector<double> chroma_after_burst_deemph =
+        input.keep_intermediates ? chroma_after_cafc_prefilter : std::move(chroma_after_cafc_prefilter);
     if (input.is_ntsc && !input.disable_deemph) {
-        result.chroma_after_burst_deemph = burst_deemphasis_cpp(
-            result.chroma_after_burst_deemph,
+        const auto t0 = kEnableDetailedChromaPerf ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+        chroma_after_burst_deemph = burst_deemphasis_cpp(
+            std::move(chroma_after_burst_deemph),
             input.lineoffset,
             input.linesout,
             input.outwidth,
             input.burst_end);
+        if constexpr (kEnableDetailedChromaPerf) {
+            result.perf.burst_deemph_s +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
     }
+    if (input.keep_intermediates) result.chroma_after_burst_deemph = chroma_after_burst_deemph;
 
-    const auto heterodyne = (input.do_cafc && !input.disable_tracking_cafc && input.chroma_afc != nullptr)
-        ? std::vector<std::vector<double>>{
+    const std::vector<std::vector<double>>* heterodyne_ptr = input.chroma_heterodyne_ref;
+    std::vector<std::vector<double>> heterodyne_owned;
+    if (input.do_cafc && !input.disable_tracking_cafc && input.chroma_afc != nullptr) {
+        heterodyne_owned = {
             std::vector<double>(input.chroma_afc->getChromaHet()[0].begin(), input.chroma_afc->getChromaHet()[0].end()),
             std::vector<double>(input.chroma_afc->getChromaHet()[1].begin(), input.chroma_afc->getChromaHet()[1].end()),
             std::vector<double>(input.chroma_afc->getChromaHet()[2].begin(), input.chroma_afc->getChromaHet()[2].end()),
-            std::vector<double>(input.chroma_afc->getChromaHet()[3].begin(), input.chroma_afc->getChromaHet()[3].end())}
-        : input.chroma_heterodyne;
-    result.uphet_raw = upconvert_chroma(
-        result.chroma_after_burst_deemph,
-        input.lineoffset,
-        input.outwidth,
-        heterodyne,
-        input.phase_sequence);
-
-    result.uphet_phase_comp = result.uphet_raw;
-    if (input.is_ntsc && !input.disable_phase_correction && input.burst_phase_avg.has_value()) {
-        result.uphet_phase_comp = ntsc_phase_comp_cpp(result.uphet_raw, *input.burst_phase_avg);
+            std::vector<double>(input.chroma_afc->getChromaHet()[3].begin(), input.chroma_afc->getChromaHet()[3].end())};
+        heterodyne_ptr = &heterodyne_owned;
+    } else if (heterodyne_ptr == nullptr) {
+        heterodyne_ptr = &input.chroma_heterodyne;
     }
+    {
+        const auto t0 = kEnableDetailedChromaPerf ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+        std::vector<double> uphet_raw = upconvert_chroma(
+            chroma_after_burst_deemph,
+            input.lineoffset,
+            input.outwidth,
+            *heterodyne_ptr,
+            input.phase_sequence);
+        if (input.keep_intermediates) result.uphet_raw = uphet_raw;
+        if constexpr (kEnableDetailedChromaPerf) {
+            result.perf.upconvert_s +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
+        std::vector<double> uphet_phase_comp =
+            (input.is_ntsc && !input.disable_phase_correction && input.burst_phase_avg.has_value())
+                ? std::vector<double>{}
+                : uphet_raw;
+        if (input.is_ntsc && !input.disable_phase_correction && input.burst_phase_avg.has_value()) {
+            const auto t0 = kEnableDetailedChromaPerf ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
+            uphet_phase_comp = ntsc_phase_comp_cpp(uphet_raw, *input.burst_phase_avg);
+            if constexpr (kEnableDetailedChromaPerf) {
+                result.perf.phase_comp_s +=
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            }
+        }
+        if (input.keep_intermediates) result.uphet_phase_comp = uphet_phase_comp;
 
-    result.uphet_filtered = sosfiltfilt_cpp(input.fchroma_final, result.uphet_phase_comp);
-    result.uphet_after_chroma_deemph = result.uphet_filtered;
-    if (input.do_chroma_deemphasis && input.chroma_deemphasis.has_value()) {
-        result.uphet_after_chroma_deemph = lfilter_cpp(*input.chroma_deemphasis, result.uphet_after_chroma_deemph);
-    }
-    result.uphet_comb = result.uphet_after_chroma_deemph;
-    if (!input.disable_comb) {
-        if (input.is_ntsc) {
-            result.uphet_comb = comb_c_ntsc_cpp(result.uphet_after_chroma_deemph, input.outwidth);
-        } else {
-            result.uphet_comb = result.uphet_after_chroma_deemph;
+        const auto t1 = kEnableDetailedChromaPerf ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+        std::vector<double> uphet_filtered = sosfiltfilt_cpp(input.fchroma_final, uphet_phase_comp);
+        if constexpr (kEnableDetailedChromaPerf) {
+            result.perf.final_filter_s +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+        }
+        if (input.keep_intermediates) result.uphet_filtered = uphet_filtered;
+
+        std::vector<double> uphet_after_chroma_deemph = std::move(uphet_filtered);
+        if (input.do_chroma_deemphasis && input.chroma_deemphasis.has_value()) {
+            const auto t2 = kEnableDetailedChromaPerf ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
+            uphet_after_chroma_deemph = lfilter_cpp(*input.chroma_deemphasis, uphet_after_chroma_deemph);
+            if constexpr (kEnableDetailedChromaPerf) {
+                result.perf.chroma_deemph_s +=
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count();
+            }
+        }
+        if (input.keep_intermediates) result.uphet_after_chroma_deemph = uphet_after_chroma_deemph;
+
+        std::vector<double> uphet_comb =
+            input.disable_comb ? uphet_after_chroma_deemph : std::vector<double>{};
+        if (!input.disable_comb) {
+            const auto t3 = kEnableDetailedChromaPerf ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
+            if (input.is_ntsc) {
+                uphet_comb = comb_c_ntsc_cpp(std::move(uphet_after_chroma_deemph), input.outwidth);
+            } else {
+                uphet_comb = uphet_after_chroma_deemph;
+            }
+            if constexpr (kEnableDetailedChromaPerf) {
+                result.perf.comb_s +=
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t3).count();
+            }
+        }
+        if (input.keep_intermediates) result.uphet_comb = uphet_comb;
+
+        const auto t4 = kEnableDetailedChromaPerf ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+        std::vector<double> uphet_final;
+        std::tie(uphet_final, result.mean_rms) = acc_cpp(
+            uphet_comb,
+            input.burst_abs_ref,
+            input.burst_start,
+            input.burst_end,
+            input.outwidth,
+            input.linesout);
+        if constexpr (kEnableDetailedChromaPerf) {
+            result.perf.acc_s +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t4).count();
+        }
+        if (input.keep_intermediates) result.uphet_final = uphet_final;
+        if (!input.keep_intermediates) {
+            std::vector<double>().swap(uphet_raw);
+            std::vector<double>().swap(uphet_phase_comp);
+            std::vector<double>().swap(uphet_after_chroma_deemph);
+            std::vector<double>().swap(uphet_comb);
+        }
+        {
+            const auto t5 = kEnableDetailedChromaPerf ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
+            result.chroma_u16 = chroma_to_u16_cpp(uphet_final);
+            if constexpr (kEnableDetailedChromaPerf) {
+                result.perf.to_u16_s +=
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t5).count();
+            }
         }
     }
-
-    std::tie(result.uphet_final, result.mean_rms) = acc_cpp(
-        result.uphet_comb,
-        input.burst_abs_ref,
-        input.burst_start,
-        input.burst_end,
-        input.outwidth,
-        input.linesout);
-    result.chroma_u16 = chroma_to_u16_cpp(result.uphet_final);
     return result;
 }
 

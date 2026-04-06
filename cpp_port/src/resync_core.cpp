@@ -47,12 +47,17 @@ void findpulses_numba_raw(
     if (sync_ref.empty()) {
         return;
     }
+    const std::size_t reserve_hint = std::max<std::size_t>(16U, sync_ref.size() / 1024U);
+    if (starts.capacity() < reserve_hint) starts.reserve(reserve_hint);
+    if (lengths.capacity() < reserve_hint) lengths.reserve(reserve_hint);
 
-    bool in_pulse = sync_ref.front() <= high;
+    const double* const data = sync_ref.data();
+    const std::size_t size = sync_ref.size();
+    bool in_pulse = data[0] <= high;
     int cur_start = 0;
 
-    for (std::size_t pos = 0; pos < sync_ref.size(); ++pos) {
-        const double value = sync_ref[pos];
+    for (std::size_t pos = 0; pos < size; ++pos) {
+        const double value = data[pos];
         if (in_pulse) {
             if (value > high) {
                 const int length = static_cast<int>(pos) - cur_start;
@@ -93,14 +98,28 @@ void findpulses_numba_raw_reduced(
     double max_synclen,
     std::vector<int>& starts,
     std::vector<int>& lengths) {
+    std::vector<double> reduced;
+    findpulses_numba_raw_reduced_into(
+        sync_ref, high, divisor, min_synclen, max_synclen, reduced, starts, lengths);
+}
+
+void findpulses_numba_raw_reduced_into(
+    const std::vector<double>& sync_ref,
+    double high,
+    int divisor,
+    double min_synclen,
+    double max_synclen,
+    std::vector<double>& reduced,
+    std::vector<int>& starts,
+    std::vector<int>& lengths) {
     if (divisor <= 0) {
         throw std::invalid_argument("divisor must be positive");
     }
-    std::vector<double> reduced;
-    reduced.reserve((sync_ref.size() + static_cast<std::size_t>(divisor) - 1U) /
-                    static_cast<std::size_t>(divisor));
-    for (std::size_t i = 0; i < sync_ref.size(); i += static_cast<std::size_t>(divisor)) {
-        reduced.push_back(sync_ref[i]);
+    const std::size_t divisor_sz = static_cast<std::size_t>(divisor);
+    const std::size_t reduced_size = (sync_ref.size() + divisor_sz - 1U) / divisor_sz;
+    reduced.resize(reduced_size);
+    for (std::size_t i = 0, j = 0; i < sync_ref.size(); i += divisor_sz, ++j) {
+        reduced[j] = sync_ref[i];
     }
 
     findpulses_numba_raw(

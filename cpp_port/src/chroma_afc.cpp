@@ -1,4 +1,5 @@
 #include "vhsdecode_cpp/chroma_afc.h"
+#include "vhsdecode_cpp/fftw_guard.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +14,35 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kTau = 2.0 * kPi;
+
+struct ComplexFftPlanCache {
+    int n = 0;
+    fftw_complex* in = nullptr;
+    fftw_complex* out = nullptr;
+    fftw_plan plan = nullptr;
+
+    ~ComplexFftPlanCache() {
+        if (plan) fftw_destroy_plan(plan);
+        if (in) fftw_free(in);
+        if (out) fftw_free(out);
+    }
+
+    void ensure(int wanted_n) {
+        if (plan != nullptr && wanted_n == n) return;
+        if (plan) fftw_destroy_plan(plan);
+        if (in) fftw_free(in);
+        if (out) fftw_free(out);
+        n = wanted_n;
+        in = reinterpret_cast<fftw_complex*>(
+            fftw_malloc(sizeof(fftw_complex) * static_cast<std::size_t>(n)));
+        out = reinterpret_cast<fftw_complex*>(
+            fftw_malloc(sizeof(fftw_complex) * static_cast<std::size_t>(n)));
+        if (!(in && out)) throw std::runtime_error("fftw allocation failed");
+        std::lock_guard<std::mutex> lock(vhsdecode::cppport::fftw_plan_mutex());
+        plan = fftw_plan_dft_1d(n, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+        if (plan == nullptr) throw std::runtime_error("fftw complex fft plan failed");
+    }
+};
 
 void require(bool cond, const char* msg) {
     if (!cond) {
@@ -258,29 +288,19 @@ std::vector<float> gen_wave_at_frequency_cpp(double frequency_hz,
 
 std::vector<std::complex<double>> fft_complex_cpp(const std::vector<double>& input) {
     const int n = static_cast<int>(input.size());
-    auto* in = reinterpret_cast<fftw_complex*>(
-        fftw_malloc(sizeof(fftw_complex) * static_cast<std::size_t>(n)));
-    auto* out = reinterpret_cast<fftw_complex*>(
-        fftw_malloc(sizeof(fftw_complex) * static_cast<std::size_t>(n)));
-    require(in && out, "fftw allocation failed");
+    thread_local ComplexFftPlanCache cache;
+    cache.ensure(n);
 
     for (int i = 0; i < n; ++i) {
-        in[i][0] = input[static_cast<std::size_t>(i)];
-        in[i][1] = 0.0;
+        cache.in[i][0] = input[static_cast<std::size_t>(i)];
+        cache.in[i][1] = 0.0;
     }
-
-    fftw_plan plan = fftw_plan_dft_1d(n, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
-    require(plan != nullptr, "fftw complex fft plan failed");
-    fftw_execute(plan);
+    fftw_execute(cache.plan);
 
     std::vector<std::complex<double>> result(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
-        result[static_cast<std::size_t>(i)] = {out[i][0], out[i][1]};
+        result[static_cast<std::size_t>(i)] = {cache.out[i][0], cache.out[i][1]};
     }
-
-    fftw_destroy_plan(plan);
-    fftw_free(in);
-    fftw_free(out);
     return result;
 }
 

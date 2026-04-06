@@ -3239,3 +3239,918 @@ SHA-256:
   - `219fe965fc303ead1a29eb73fb1dde23688b4dcdabf19c7c582037f64c2a4cbb`
 - repro `.tbc.json`:
   - `219fe965fc303ead1a29eb73fb1dde23688b4dcdabf19c7c582037f64c2a4cbb`
+
+## Parallel Bring-Up On The Faithful Port (2026-04-04)
+
+First real chunk-worker pass is now wired into the current faithful
+`cpp_port` decoder through `--threads N`.
+
+What it does:
+
+- splits the input file into overlapping sample chunks
+- each worker runs the current faithful live decode loop on its chunk
+- each worker writes temp chunk outputs
+- supervisor stitches by exact `fileLoc` / `fieldPhaseID` / `isFirstField`
+- final `.tbc`, `_chroma.tbc`, and `.tbc.json` are merged in-order
+
+Important outcome:
+
+- correctness: yes
+- speedup: not yet
+
+Verification on a bounded real decode:
+
+- input:
+  - `/media/hunter/DATA/captures/TAPE_1_parallel_short.u8`
+- single-thread output:
+  - `/media/hunter/DATA/captures/TAPE_1_parallel_short_single.*`
+- 2-worker output:
+  - `/media/hunter/DATA/captures/TAPE_1_parallel_short_t2.*`
+
+Exact output match:
+
+- luma `.tbc`: SHA-256 identical
+- chroma `.tbc`: SHA-256 identical
+- `.tbc.json`: SHA-256 identical
+
+Hashes:
+
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_single.tbc`
+  - `e6c7acd6f061f4684f04e6b0673576526112c262428e2d1ef4d2a440cea9b750`
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_t2.tbc`
+  - `e6c7acd6f061f4684f04e6b0673576526112c262428e2d1ef4d2a440cea9b750`
+
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_single_chroma.tbc`
+  - `2990eb67427d9fbadbdf27f224c34e62a851d8609c10162225d5841e806e77ab`
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_t2_chroma.tbc`
+  - `2990eb67427d9fbadbdf27f224c34e62a851d8609c10162225d5841e806e77ab`
+
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_single.tbc.json`
+  - `72c70474649e525e2455239b945bd48a75b53953cca2e230df9e71f3f7000661`
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_t2.tbc.json`
+  - `72c70474649e525e2455239b945bd48a75b53953cca2e230df9e71f3f7000661`
+
+Observed throughput on that bounded run:
+
+- single-thread:
+  - `40` written fields in `9.40s`
+  - `4.26 fields/s`
+- 2-worker first pass:
+  - `40` written fields in `10.21s`
+  - `3.92 fields/s`
+
+Why it is slower right now:
+
+- parts of the current port still create ad-hoc FFTW plans inside hot-path
+  helper FFT wrappers
+- FFTW planner state is not thread-safe
+- to get the first orchestrator running correctly, those ad-hoc plan sites now
+  share one global mutex
+- that preserves correctness, but it serializes too much FFT-heavy work
+
+So the architectural result is good:
+
+- chunk-worker orchestration works
+- stitching is correct on a real decode
+
+But the immediate optimization target is now obvious:
+
+- replace ad-hoc FFTW plan/create/destroy calls in hot-path helper FFTs with
+  reusable worker-local FFT state so workers can actually run concurrently
+
+## Single-Worker Speed Plan (2026-04-04)
+
+Before pushing harder on parallelism, optimize the `1`-worker case first.
+Reason: every parallel worker runs the same decode loop, so a bloated worker
+just scales poorly across more threads.
+
+Planned order:
+
+1. Remove ad-hoc FFTW planning from hot helper paths.
+   - First targets:
+     - `cpp_port/src/demod_block.cpp`
+     - `cpp_port/src/chroma_process.cpp`
+     - `cpp_port/src/chroma_afc.cpp`
+   - Goal:
+     - create reusable worker-local FFT state once
+     - execute many times
+   - This should improve both:
+     - single-worker throughput
+     - future multi-worker scaling
+
+2. Re-profile `K2` once FFT overhead is reduced.
+   - Current profiling keeps showing `K2` as too large.
+   - Need to separate:
+     - real algorithmic cost
+     - copy/allocation overhead around it
+
+3. Cut vector copies/allocation in the live loop.
+   - Especially in:
+     - `cpp_port/src/ntsc_vhs_decode_main.cpp`
+   - Focus:
+     - `assign(...)`
+     - repeated temp vector materialization
+     - large per-field buffer churn
+
+4. Re-measure single-worker throughput after each step.
+   - Do not guess.
+   - Only after the worker is meaningfully faster should parallel scaling
+     become the next main focus again.
+
+Current step:
+
+- Step 1 in progress
+- starting with reusable FFT state in `demod_block.cpp`
+
+Step 1 result:
+
+- ad-hoc FFT planning removed from:
+  - `cpp_port/src/demod_block.cpp`
+  - `cpp_port/src/chroma_process.cpp`
+  - `cpp_port/src/chroma_afc.cpp`
+- bounded single-worker benchmark on
+  `/media/hunter/DATA/captures/TAPE_1_parallel_short.u8`
+  improved from:
+  - `40` fields in `9.3976s`
+  - `4.2564 fields/s`
+  to:
+  - `40` fields in `8.9378s`
+  - `4.4754 fields/s`
+- gain: about `5.1%`
+- output stayed byte-for-byte identical:
+  - luma `.tbc`
+  - chroma `.tbc`
+  - `.tbc.json`
+
+## K2 Profiling And First Single-Worker Follow-Up (2026-04-04)
+
+After Step 1, the bounded single-worker run was re-profiled in finer detail.
+
+Bounded result:
+
+- output:
+  - `/media/hunter/DATA/captures/TAPE_1_parallel_short_single_k2prof3.*`
+- timing:
+  - `read_s=2.322205`
+  - `k2_s=3.813573`
+  - `k3_s=0.435123`
+  - `k4_s=1.411879`
+  - `write_s=0.009918`
+- throughput:
+  - `40` written fields in `8.5797s`
+  - `4.6621 fields/s`
+
+Important split:
+
+- `K2` is almost entirely `get_pulses()`
+- on the bounded run:
+  - `k2_s = 3.8136`
+  - `k2_get_pulses_s = 3.7436`
+- everything else inside K2 was tiny:
+  - `refine_pulses`: `0.000276`
+  - `first_hsync`: `0.000193`
+  - `linelocs0`: `0.000177`
+  - `hsync refine`: `0.006222`
+
+So the next real target became:
+
+- `ResyncRuntime::get_pulses()`
+
+That was split further.
+
+On `/media/hunter/DATA/captures/TAPE_1_parallel_short_serr2prof2.*`:
+
+- `k2_get_pulses_s = 3.7208`
+- inside that:
+  - `k2_serration_work_s = 3.4448`
+  - `k2_add_pulselevels_s = 0.2301`
+  - `k2_level_apply_s = 0.0289`
+  - `k2_final_findpulses_s = 0.0169`
+
+And inside `vsync_serration.work()` itself:
+
+- `k2_serration_reduce_s = 0.0684`
+- `k2_serration_envelope_s = 1.3576`
+- `k2_serration_power_ratio_s = 1.4839`
+- `k2_serration_search_eq_s = 0.5059`
+
+Conclusion:
+
+- `vsync_serration.work()` is the dominant single-worker hotspot
+- biggest sub-buckets:
+  - `power_ratio_search()`
+  - `vsync_envelope()`
+- the rest is much smaller
+
+First follow-up optimization inside `vsync_serration`:
+
+- precompute the fixed filtfilt startup state (`zi`) for:
+  - `vsync_env`
+  - `serration_base_lo`
+  - `serration_base_hi`
+  - `serration_envelope`
+- reuse those cached startup vectors every field instead of recomputing them
+
+Result on:
+
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_serr1.*`
+
+timing:
+
+- `read_s=2.132470`
+- `k2_s=3.766931`
+- `k2_get_pulses_s=3.695479`
+- `k2_serration_work_s=3.428947`
+- `k3_s=0.404115`
+- `k4_s=1.412987`
+- `write_s=0.010279`
+
+throughput:
+
+- `40` fields in `8.2430s`
+- `4.8526 fields/s`
+
+That is:
+
+- about `8.1%` faster than the original `4.4754 fields/s` post-step-1 run
+- about `14.0%` faster than the original `4.2564 fields/s` pre-speedup baseline
+
+Correctness:
+
+- output stayed byte-for-byte identical to the original bounded single-thread
+  decode:
+  - luma `.tbc`
+  - chroma `.tbc`
+  - `.tbc.json`
+
+Second follow-up cleanup:
+
+- remove a couple of remaining obvious full-buffer copies in
+  `vsync_serration`:
+  - skip the `reduced` copy entirely when `divisor == 1`
+  - reuse the forward envelope buffer in `vsync_envelope_double()`
+
+Result on:
+
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_serr3.*`
+
+timing:
+
+- `read_s=2.330770`
+- `k2_s=3.770665`
+- `k2_get_pulses_s=3.695043`
+- `k2_serration_work_s=3.430582`
+- `k2_serration_reduce_s=0.066538`
+- `k2_serration_envelope_s=1.348865`
+- `k2_serration_power_ratio_s=1.483759`
+- `k2_serration_search_eq_s=0.502312`
+- `k3_s=0.440716`
+- `k4_s=1.415130`
+- `write_s=0.008753`
+
+throughput:
+
+- `40` fields in `8.5350s`
+- `4.6866 fields/s`
+
+This second cleanup was essentially neutral on the bounded benchmark.
+
+So the current best bounded single-worker result remains:
+
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_serr1.*`
+- `4.8526 fields/s`
+
+Current conclusion:
+
+- the next real performance win is not more tiny copy cleanup
+- it should come from deeper work inside:
+  - `vsync_envelope()`
+  - `power_ratio_search()`
+  in `cpp_port/src/vsync_serration.cpp`
+
+Further `vsync_serration` work:
+
+1. Cached reverse-envelope path and precomputed filter edge sizes.
+   - Reused cached `vsync_env` filtfilt startup state for the reverse pass in
+     `vsync_envelope_double()`
+   - Precomputed edge lengths for the fixed filters at construction time
+   - This improved the hotspot timings:
+     - `k2_get_pulses_s` down to about `3.5330`
+     - `k2_serration_work_s` down to about `3.2247`
+     - `k2_serration_power_ratio_s` down to about `1.2940`
+     - `k2_serration_envelope_s` down to about `1.3595`
+   - But full bounded wall time was still noisy, so that change alone was not
+     a clear overall win.
+
+2. Switched median calculations from full sort to `nth_element`.
+   - Affected:
+     - `search_eq_pulses()`
+     - `get_serration_sync_levels_cpp()`
+   - Again, hotspot timings moved in the right direction, but full wall time
+     still bounced enough that it was not the decisive gain by itself.
+
+3. Big win: stop populating `last_debug_` during normal decode.
+   - `VsyncSerration` was still filling debug-only vectors on every field:
+     - `envelope`
+     - `minima`
+     - `serrations`
+     - `arbitrated`
+     - `serration_locs`
+   - That data is only needed for parity/debug inspection, not live decode.
+   - Gated all `last_debug_` population behind `show_decoded_`.
+   - Updated `k2_vsync_parity_main.cpp` to set:
+     - `cfg.show_decoded_serration = true`
+     so parity/debug tools still get the same diagnostics.
+
+Result on:
+
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_serr6.*`
+
+timing:
+
+- `read_s=2.336391`
+- `k2_s=3.016264`
+- `k2_get_pulses_s=2.936133`
+- `k2_serration_work_s=2.673530`
+- `k2_serration_envelope_s=1.274118`
+- `k2_serration_power_ratio_s=1.235338`
+- `k2_serration_search_eq_s=0.088705`
+- `k3_s=0.434776`
+- `k4_s=1.394984`
+- `write_s=0.008340`
+
+throughput:
+
+- `40` fields in `7.7759s`
+- `5.1441 fields/s`
+
+Comparison:
+
+- original bounded baseline:
+  - `4.2564 fields/s`
+- after FFT cleanup only:
+  - `4.4754 fields/s`
+- after first `vsync_serration` zi caching:
+  - `4.8526 fields/s`
+- after removing debug-only serration bookkeeping:
+  - `5.1441 fields/s`
+
+So current best bounded single-worker speedup vs original baseline is:
+
+- about `20.9%`
+
+Correctness:
+
+- `/media/hunter/DATA/captures/TAPE_1_parallel_short_serr6.*`
+  is byte-for-byte identical to the original bounded single-thread decode:
+  - luma `.tbc`
+  - chroma `.tbc`
+  - `.tbc.json`
+
+2026-04-05: K2 deep single-thread speed pass finally paid off.
+
+Goal:
+
+- exhaust faithful K2 speedups before returning to broader optimization work
+
+Key changes kept:
+
+- `cpp_port/src/vsync_serration.cpp`
+  - normalized IIR coefficients once at construction time
+  - removed extra trimmed-envelope copies on the normal path
+  - kept serration minima on reusable member buffers instead of copying them
+  - tightened `filtfilt_into()` buffer assembly and reverse-path handling
+  - specialized `iir_lfilter_into_cpp()` for the actual NTSC filter tap counts
+    used in the serration path (`4`, `5`, and `6` taps)
+- `cpp_port/src/resync_core.cpp`
+  - tightened `findpulses_numba_raw()`
+  - made reduced sync construction fixed-size instead of repeated `push_back`
+- `cpp_port/src/resync_runtime.cpp`
+  - reused raw pulse/reduced-sync scratch buffers in the pulse-level path
+
+Important note:
+
+- every kept change above stayed byte-identical on:
+  - short native `.tbc`
+  - short native `_chroma.tbc`
+  - short native `.tbc.json`
+
+Best short native result:
+
+- input:
+  - `/media/hunter/DATA/captures/TAPE_1_parallel_short.u8`
+- output:
+  - `/media/hunter/DATA/captures/k2filter11_native_short.*`
+- result:
+  - `40` fields seen
+  - `39` written
+  - `elapsed_s = 5.407115768`
+
+Short native timing comparison:
+
+- old K2-profile baseline:
+  - `/media/hunter/DATA/captures/k2profile_native_short_rerun.all`
+  - `elapsed_s = 7.022464973`
+  - `k2_s = 2.970550`
+  - `k2_get_pulses_s = 2.815950`
+  - `k2_serration_work_s = 2.558607`
+- final K2 pass:
+  - `/media/hunter/DATA/captures/k2filter11_native_short.all`
+  - `elapsed_s = 5.407115768`
+  - `k2_s = 1.692395`
+  - `k2_get_pulses_s = 1.543506`
+  - `k2_serration_work_s = 1.359330`
+  - `k2_serration_envelope_s = 0.634748`
+  - `k2_serration_power_ratio_s = 0.630810`
+  - `k2_add_pulselevels_s = 0.145412`
+
+Short native improvement:
+
+- wall time down by about `23.0%` vs the old K2-profile baseline
+- K2 total down by about `43.0%`
+
+Full one-minute native result:
+
+- strict same-thread `vhs-decode` baseline:
+  - `/media/hunter/DATA/captures/fullcmp_tape1_vhsdecode_syncexec.json`
+  - `wall_total = 438.859423482`
+- VHSpp final K2 build:
+  - `/media/hunter/DATA/captures/fullcmp_tape1_vhspp_serial_k2filter11.all`
+  - `elapsed_s = 416.784502504`
+
+Full one-minute native comparison:
+
+- VHSpp is now faster than strict same-thread `vhs-decode` by:
+  - `22.0749s`
+  - about `5.03%`
+
+Final VHSpp full-file stage timings:
+
+- `read_s = 149.789462`
+- `k2_s = 137.952336`
+- `k2_get_pulses_s = 131.553383`
+- `k2_serration_work_s = 115.706149`
+- `k2_serration_envelope_s = 53.326179`
+- `k2_serration_power_ratio_s = 54.453815`
+- `k2_serration_search_eq_s = 7.910141`
+- `k2_add_pulselevels_s = 12.514824`
+- `k2_level_apply_s = 2.384069`
+- `k2_final_findpulses_s = 0.946189`
+- `k3_s = 16.532442`
+- `k4_s = 94.970067`
+- `write_s = 3.002780`
+
+Correctness on the full native run:
+
+- `/media/hunter/DATA/captures/fullcmp_tape1_vhspp_serial_k2filter11.*`
+  is byte-for-byte identical to:
+  - `/media/hunter/DATA/captures/fullcmp_tape1_vhspp_serial_readlazy1.*`
+  for:
+  - luma `.tbc`
+  - chroma `.tbc`
+  - `.tbc.json`
+
+2026-04-06 - chunk-worker parallelism restored on top of the fast single-thread worker
+
+Restored the `c64335a` style chunk-worker architecture in the current live driver instead of
+the old discarded from-scratch pipeline.
+
+What changed:
+
+- added `--threads N` support back to `vhsdecode_decode`
+- split the current decode runner into:
+  - single-worker `run_decode_driver_single(...)`
+  - multi-worker `run_decode_driver(...)`
+- partitioned the input file into owned sample ranges with overlap
+- each worker now decodes its own overlapped chunk into temp `.tbc`, `_chroma.tbc`,
+  and `.tbc.json` outputs
+- supervisor merge keeps only fields whose `fileLoc` belongs to the worker's owned range
+- merged outputs are rebuilt in sorted `fileLoc` order
+
+Parallel correctness fixes:
+
+- short-clip merge was already exact on payload, but reducing overlap exposed a metadata issue:
+  - `fieldPhaseID` restarted locally in later chunks
+  - fixed by deriving a per-chunk 4-phase rotation from overlapping `fileLoc` matches and
+    normalizing `fieldPhaseID` during merge
+- full-file 2-thread startup initially segfaulted inside FFTW during K1 context construction
+  because both workers were building K1 FFT context concurrently
+  - fixed by serializing `build_k1_context(k1_cfg)` under `fftw_plan_mutex()`
+- worker temp cleanup now also removes per-worker `firstfield.*` debug artifacts
+- worker logging is now quiet in parallel mode by honoring `args.verbose`
+- overlap is no longer hardcoded to 40 fields on tiny inputs:
+  - it now scales down for short clips, which avoids both workers decoding nearly the same prefix
+
+Short full-clip parity result:
+
+- single-thread:
+  - `/media/hunter/DATA/captures/parshortfull_t1.stdout.json`
+  - `elapsed_s = 6.686877684`
+- two-thread:
+  - `/media/hunter/DATA/captures/parshortfull_t2.stdout.json`
+  - `elapsed_s = 4.677955627`
+- outputs are byte-identical:
+  - `.tbc`
+  - `_chroma.tbc`
+  - `.tbc.json`
+
+Full one-minute native parity result:
+
+- single-thread current build:
+  - `/media/hunter/DATA/captures/fullpar_tape1_t1.stdout.json`
+  - `elapsed_s = 478.929134657`
+  - `fields_written = 3593`
+- two-thread chunk-worker:
+  - `/media/hunter/DATA/captures/fullpar_tape1_t2_probe`
+  - `elapsed_s = 249.827233493`
+  - `fields_written = 3593`
+
+Full one-minute native parallel speedup:
+
+- two-thread chunk workers are about `1.917x` faster than one thread
+- equivalently, about `91.7%` faster
+
+Full one-minute native output equality:
+
+- `/media/hunter/DATA/captures/fullpar_tape1_t1.tbc`
+  == `/media/hunter/DATA/captures/fullpar_tape1_t2.tbc`
+- `/media/hunter/DATA/captures/fullpar_tape1_t1_chroma.tbc`
+  == `/media/hunter/DATA/captures/fullpar_tape1_t2_chroma.tbc`
+- `/media/hunter/DATA/captures/fullpar_tape1_t1.tbc.json`
+  == `/media/hunter/DATA/captures/fullpar_tape1_t2.tbc.json`
+
+Scaling follow-up:
+
+- corrected 4-thread chunk-worker run:
+  - `/media/hunter/DATA/captures/fullpar_tape1_t4b.stdout.json`
+  - `elapsed_s = 154.419878142`
+  - outputs are byte-identical to single-thread for:
+    - `.tbc`
+    - `_chroma.tbc`
+    - `.tbc.json`
+- corrected 8-thread chunk-worker run:
+  - `/media/hunter/DATA/captures/fullpar_tape1_t8.stdout.json`
+  - `elapsed_s = 163.096460456`
+  - outputs are byte-identical to single-thread for:
+    - `.tbc`
+    - `_chroma.tbc`
+    - `.tbc.json`
+
+Scaling interpretation:
+
+- `4` threads is currently the best point on the full one-minute native sample
+- `4` threads vs `1` thread:
+  - about `2.624x` speedup
+  - about `162.4%` faster
+- `8` threads vs `1` thread:
+  - about `2.936x` speedup
+  - about `193.6%` faster
+- but `8` threads is about `5.32%` slower than `4` threads
+
+So the first clear scaling knee is between `4` and `8` workers on this machine and this
+chunk geometry. The likely causes are overlap waste plus cache/memory-bandwidth pressure.
+
+2026-04-06 - hardware-aware parallel worker sizing and shared immutable state
+
+To understand why `8` workers lost to `4`, I profiled both the machine and a pinned
+single-worker vs pinned four-worker short run.
+
+Hardware:
+
+- CPU: Intel `i9-12900K`
+- logical CPUs: `24`
+- threads per core: `2`
+- shared L3: `30 MiB`
+- CPU `0` shares private cache with CPU `1`; all workers share the same `30 MiB` L3
+
+Pinned short-run footprint before any worker-footprint work:
+
+- `1` worker max RSS:
+  - `/media/hunter/DATA/captures/rss1_short.time.txt`
+  - `491644 kB`
+- `4` workers max RSS:
+  - `/media/hunter/DATA/captures/rss4_short.time.txt`
+  - `1793864 kB`
+
+Pinned short-run cache behavior before any worker-footprint work:
+
+- `1` worker:
+  - IPC about `1.45`
+  - cache-miss ratio about `59.4%`
+  - LLC-load miss ratio about `76.2%`
+- `4` workers:
+  - IPC about `1.35`
+  - cache-miss ratio about `64.6%`
+  - LLC-load miss ratio about `78.7%`
+
+So the old chunk-worker scaling knee really was a cache/bandwidth problem, not just a
+vague intuition.
+
+I then broke down the per-worker footprint. The dominant duplicated cost was the
+per-worker `DemodCache`.
+
+Current native geometry:
+
+- `blocklen = 32768`
+- `blockcut = 1024`
+- `blockcut_end = 1024`
+- effective cached `blocksize = 30720`
+
+Per cached block:
+
+- `rawinput`
+- `input`
+- `video`
+- `video_05`
+- `chroma`
+
+Total per cached block is about `1.1875 MiB`.
+
+At the old fixed `cache_size = 256`, that is about `304 MiB` per worker just for
+`DemodCache`.
+
+Other duplicated per-worker state was much smaller but still real:
+
+- immutable chroma config:
+  - about `18.3 MiB`
+- K1 context:
+  - about `6.25 MiB`
+- live merged window:
+  - about `20.6 MiB`
+- final outputs:
+  - about `1.83 MiB`
+
+So I made two structural changes:
+
+- added `cpp_port/include/vhsdecode_cpp/hardware_info.h`
+- added `cpp_port/src/hardware_info.cpp`
+
+Those isolate platform-specific hardware queries:
+
+- Linux:
+  - total RAM from `sysinfo`
+  - L3 size and sharing from `/sys/devices/system/cpu/.../cache`
+- macOS:
+  - `sysctlbyname(...)`
+- Windows:
+  - `GlobalMemoryStatusEx`
+  - `GetLogicalProcessorInformationEx`
+
+And then I changed the parallel worker model:
+
+- `DemodCache` size is no longer effectively fixed in chunk-worker mode
+- parallel workers now derive a cache-block budget from:
+  - thread count
+  - total RAM
+  - detected shared L3 size
+- single-thread mode still keeps the full cache
+- K1 context is now shared immutable state across workers instead of being duplicated
+- phase and field chroma config are now also shared immutable state across workers
+
+Short pinned results after adaptive cache sizing and shared immutable state:
+
+- `1` worker:
+  - `/media/hunter/DATA/captures/rss1_short_adaptive.time.txt`
+  - max RSS `492764 kB`
+- `4` workers:
+  - `/media/hunter/DATA/captures/rss4_short_adaptive.time.txt`
+  - max RSS `959092 kB`
+
+So:
+
+- total `4`-worker RSS dropped by about `46.5%`
+- incremental RSS from `1 -> 4` workers dropped from about `1302220 kB`
+  to about `466328 kB`
+- that is about a `64.2%` reduction in incremental worker footprint
+
+Pinned short-run cache behavior after adaptive/shared-state work:
+
+- `1` worker:
+  - `/media/hunter/DATA/captures/perf1_short_adaptive.perf.csv`
+  - IPC about `1.659`
+  - cache-miss ratio about `44.9%`
+  - LLC-load miss ratio about `65.3%`
+- `4` workers:
+  - `/media/hunter/DATA/captures/perf4_short_adaptive.perf.csv`
+  - IPC about `1.609`
+  - cache-miss ratio about `49.5%`
+  - LLC-load miss ratio about `72.3%`
+
+So the worker did not just get thinner in RSS. Cache pressure improved materially too.
+
+Full one-minute native scaling after adaptive/shared-state work:
+
+- `4` threads:
+  - `/media/hunter/DATA/captures/fullpar_tape1_t4_adaptive.stdout.json`
+  - `elapsed_s = 135.244314129`
+- `8` threads:
+  - `/media/hunter/DATA/captures/fullpar_tape1_t8_adaptive.stdout.json`
+  - `elapsed_s = 145.091877517`
+
+Both runs are still byte-identical to the single-thread reference for:
+
+- `.tbc`
+- `_chroma.tbc`
+- `.tbc.json`
+
+Comparison to the previous exact full-minute parallel runs:
+
+- old `4` threads:
+  - `154.419878142 s`
+- new `4` threads:
+  - `135.244314129 s`
+  - about `12.4%` faster
+
+- old `8` threads:
+  - `163.096460456 s`
+- new `8` threads:
+  - `145.091877517 s`
+  - about `11.0%` faster
+
+So the scaling knee did move in the right direction:
+
+- `4` threads is still the best point so far
+- but `8` threads is now less bad than before
+- the project is no longer paying nearly as much per-worker memory duplication as it was
+
+The next likely scaling lever is to keep shrinking per-worker mutable state:
+
+- demod window materialization
+- K2/K4 scratch that still duplicates per worker
+- anything else large that does not need to be worker-private
+
+2026-04-06 - parallel worker-thinning experiments after adaptive/shared-state baseline
+
+With the adaptive/shared-state worker model in place, I tried the next obvious
+footprint cuts. Two of them looked plausible on paper and both stayed
+byte-identical, but neither was a keeper.
+
+Failed experiment 1: K4 by-reference downscale inputs
+
+Idea:
+
+- stop cloning `window->video` / `window->chroma` into `DownscaleCoreInput.demod`
+- let `downscale_luma()` read directly from a referenced `std::vector<double>`
+
+What happened:
+
+- exactness was preserved
+- memory dropped slightly
+- but the hot interpolation loop got slower
+
+Measured results:
+
+- short single-thread:
+  - `/media/hunter/DATA/captures/downref_short.stdout.json`
+  - `elapsed_s = 5.2935154789999999`
+- pinned short `4`-worker RSS:
+  - `/media/hunter/DATA/captures/downref4_short.time.txt`
+  - max RSS `922504 kB`
+- full one-minute native `4` threads:
+  - `/media/hunter/DATA/captures/fullpar_tape1_t4_downref.stdout.json`
+  - `elapsed_s = 159.08381715199999`
+
+That is much worse than the adaptive/shared-state `4`-thread baseline at:
+
+- `/media/hunter/DATA/captures/fullpar_tape1_t4_adaptive.stdout.json`
+- `elapsed_s = 135.244314129`
+
+Conclusion:
+
+- saving one big copy is not worth it if it adds indirection and type-conversion
+  cost inside the hottest interpolation loop
+- reverted
+
+Failed experiment 2: store cached raw RF blocks as `uint8_t`
+
+Idea:
+
+- keep `DemodCache` raw blocks as bytes instead of `double`
+- expand to `double` only into a reusable scratch vector during demod
+
+Why it looked promising:
+
+- cached raw input is the least semantically demanding channel
+- byte storage should reduce worker-private cache footprint directly
+
+What happened:
+
+- exactness was preserved
+- memory dropped slightly
+- but the per-block `uint8_t -> double` expansion cost hurt enough to lose overall
+
+Measured results:
+
+- pinned short `4`-worker RSS:
+  - `/media/hunter/DATA/captures/rawu8cache4_short_clean.time.txt`
+  - max RSS `928620 kB`
+- full one-minute native `4` threads:
+  - `/media/hunter/DATA/captures/fullpar_tape1_t4_rawu8cache.stdout.json`
+  - `elapsed_s = 160.83263998300001`
+
+Again, that is materially worse than the `135.244314129 s` adaptive/shared-state
+baseline.
+
+Conclusion:
+
+- the conversion tax outweighed the memory win
+- reverted
+
+Thin-cache experiment and cache-read bug
+
+I also tried lowering the adaptive parallel `DemodCache` floor from `32` blocks to
+`16` blocks so high worker counts could carry less cache.
+
+That immediately exposed a real bug:
+
+- `fatal: unordered_map::at`
+
+Cause:
+
+- `DemodCache::read()` was still pruning while loading a multi-block read window
+- with a small enough cache, earlier blocks in the current read could be evicted
+  before final assembly
+
+Fix:
+
+- added transient protection so the entire in-flight read-window block span is kept
+  resident until the read is fully assembled
+
+After that fix, the thin-cache path became valid, but still slower:
+
+- short `4` threads:
+  - `/media/hunter/DATA/captures/min16fix_t4_short_clean2.stdout.json`
+  - `elapsed_s = 8.0314636250000007`
+- short `8` threads:
+  - `/media/hunter/DATA/captures/min16fix_t8_short_clean2.stdout.json`
+  - `elapsed_s = 8.1833218399999996`
+
+So the `16`-block floor is not a win either.
+
+Conclusion:
+
+- keep the read-window protection fix
+- restore the better `32`-block parallel floor
+
+Current checkpoint state after these experiments
+
+The tree is back on the last known-good fast parallel shape, plus the useful
+`DemodCache::read()` protection fix:
+
+- adaptive parallel `DemodCache` sizing
+- shared immutable K1 context
+- shared immutable phase/field chroma config
+- protected current read-window block span during cache assembly
+
+Best exact full one-minute native parallel numbers still are:
+
+- `4` threads:
+  - `/media/hunter/DATA/captures/fullpar_tape1_t4_adaptive.stdout.json`
+  - `elapsed_s = 135.244314129`
+- `8` threads:
+  - `/media/hunter/DATA/captures/fullpar_tape1_t8_adaptive.stdout.json`
+  - `elapsed_s = 145.091877517`
+
+Plan from here: demod-window redesign
+
+The next step should not be another micro-footprint tweak. The next structural
+target is demod window materialization itself.
+
+Current shape:
+
+- `DemodCache::read()` concatenates cached block payloads into large contiguous
+  per-field vectors:
+  - `video`
+  - `video_05`
+  - `chroma`
+- `decode_field()` then immediately clones and repackages those again for the
+  next stages
+
+That is the remaining big structural source of worker-private memory traffic.
+
+The redesign goal is:
+
+- stop treating every field as:
+  - "first build one giant merged window"
+  - then start decode
+
+Proposed redesign:
+
+- introduce a block-backed `DemodWindowView`
+  - references cached blocks plus logical range metadata
+- let the worker own reusable contiguous scratch buffers
+- materialize only the channels actually needed, and only when needed
+- keep hot math loops operating on contiguous buffers
+- avoid forcing K2/K4 inner loops to read scattered block views directly
+
+Staged plan:
+
+- add a non-owning block-backed window type in `demod_cache.h`
+- make `DemodCache` expose that view instead of always returning merged vectors
+- add reusable contiguous scratch buffers in the decode worker
+- materialize `video` and `video_05` first for K2
+- delay `chroma` materialization until the field is valid enough to continue
+- rerun exactness and full-minute `4` / `8` worker scaling checks
+
+That is the next serious shot at moving the scaling knee outward without poisoning
+the hottest compute loops.

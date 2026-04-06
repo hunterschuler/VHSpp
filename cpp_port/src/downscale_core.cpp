@@ -294,24 +294,68 @@ DownscaleCoreResult downscale_luma(const DownscaleCoreInput& input) {
     require(input.demod.size() >= 4U, "downscale_luma requires demod data");
 
     DownscaleCoreResult result{};
-    const std::size_t loc_count = input.linelocs.size();
-    std::vector<double> expected_linelocs(loc_count, 0.0);
-    for (std::size_t i = 0; i < loc_count; ++i) expected_linelocs[i] = static_cast<double>(i) * input.inlinelen;
-
     const double outscale = input.inlinelen / static_cast<double>(input.outlinelen);
     const int outsamples = input.outlinecount * input.outlinelen;
     const int outline_offset = (input.lineoffset + 1) * input.outlinelen;
     const int total_scaled = outsamples + outline_offset;
 
-    result.interpolated_pixel_locs.resize(static_cast<std::size_t>(total_scaled));
-    result.wowfactors.resize(static_cast<std::size_t>(total_scaled));
+    std::vector<double> wowfactors;
+    std::vector<double> level_adjusts(static_cast<std::size_t>(total_scaled));
+    std::vector<double> interpolated_pixel_locs;
     if (input.wow_spline_degree <= 1) {
-        for (int i = 0; i < total_scaled; ++i) {
-            const double x = static_cast<double>(i) * outscale;
-            result.interpolated_pixel_locs[static_cast<std::size_t>(i)] = eval_linear_spline(expected_linelocs, input.linelocs, x);
-            result.wowfactors[static_cast<std::size_t>(i)] = eval_linear_spline_derivative(expected_linelocs, input.linelocs, x);
+        const int line_count = total_scaled / input.outlinelen;
+        std::vector<double> line_adjusts(static_cast<std::size_t>(line_count));
+        const int max_seg = static_cast<int>(input.linelocs.size()) - 2;
+        for (int seg = 0; seg < line_count; ++seg) {
+            const int use_seg = std::min(seg, max_seg);
+            line_adjusts[static_cast<std::size_t>(seg)] =
+                (input.linelocs[static_cast<std::size_t>(use_seg + 1)] - input.linelocs[static_cast<std::size_t>(use_seg)]) /
+                input.inlinelen;
+        }
+
+        const double median = median_copy(line_adjusts);
+        std::vector<double> absdev(line_adjusts.size());
+        for (std::size_t i = 0; i < line_adjusts.size(); ++i) absdev[i] = std::abs(line_adjusts[i] - median);
+        const double mad = median_copy(absdev);
+        const double threshold = (mad > 0.0) ? 15.0 * mad : 0.001;
+        for (double& v : line_adjusts) {
+            if (std::abs(v - median) > threshold) v = median;
+        }
+
+        if (input.keep_debug_arrays) wowfactors.resize(static_cast<std::size_t>(total_scaled));
+        if (input.wow_level_adjust_smoothing > 0.0) {
+            const double alpha = 1.0 / (input.wow_level_adjust_smoothing * static_cast<double>(input.outlinelen));
+            const double one_minus_alpha = 1.0 - alpha;
+            level_adjusts[0] = line_adjusts[0];
+            for (int seg = 0; seg < line_count; ++seg) {
+                const double line_wow = line_adjusts[static_cast<std::size_t>(seg)];
+                const int start = seg * input.outlinelen;
+                const int end = start + input.outlinelen;
+                if (input.keep_debug_arrays) {
+                    for (int i = start; i < end; ++i) wowfactors[static_cast<std::size_t>(i)] = line_wow;
+                }
+                for (int i = (seg == 0 ? 1 : start); i < end; ++i) {
+                    level_adjusts[static_cast<std::size_t>(i)] =
+                        alpha * line_wow + one_minus_alpha * level_adjusts[static_cast<std::size_t>(i - 1)];
+                }
+            }
+        } else {
+            for (int seg = 0; seg < line_count; ++seg) {
+                const double line_wow = line_adjusts[static_cast<std::size_t>(seg)];
+                const int start = seg * input.outlinelen;
+                const int end = start + input.outlinelen;
+                for (int i = start; i < end; ++i) {
+                    level_adjusts[static_cast<std::size_t>(i)] = line_wow;
+                    if (input.keep_debug_arrays) wowfactors[static_cast<std::size_t>(i)] = line_wow;
+                }
+            }
         }
     } else {
+        const std::size_t loc_count = input.linelocs.size();
+        std::vector<double> expected_linelocs(loc_count, 0.0);
+        for (std::size_t i = 0; i < loc_count; ++i) expected_linelocs[i] = static_cast<double>(i) * input.inlinelen;
+        if (input.keep_debug_arrays) wowfactors.resize(static_cast<std::size_t>(total_scaled));
+        interpolated_pixel_locs.resize(static_cast<std::size_t>(total_scaled));
         const auto& knots = input.wow_spline_precomputed
             ? input.spline_knots
             : (input.wow_spline_degree == 2 ? build_not_a_knot(expected_linelocs, 2) : build_augknt(expected_linelocs, 3));
@@ -322,47 +366,75 @@ DownscaleCoreResult downscale_luma(const DownscaleCoreInput& input) {
         for (int i = 0; i < total_scaled; ++i) {
             const double x = static_cast<double>(i) * outscale;
             const auto [v, d] = eval_bspline_and_derivative(knots, coeffs, input.wow_spline_degree, x);
-            result.interpolated_pixel_locs[static_cast<std::size_t>(i)] = v;
-            result.wowfactors[static_cast<std::size_t>(i)] = d;
+            interpolated_pixel_locs[static_cast<std::size_t>(i)] = v;
+            level_adjusts[static_cast<std::size_t>(i)] = d;
+            if (input.keep_debug_arrays) wowfactors[static_cast<std::size_t>(i)] = d;
         }
-    }
+        const double median = median_copy(level_adjusts);
+        std::vector<double> absdev(level_adjusts.size());
+        for (std::size_t i = 0; i < level_adjusts.size(); ++i) absdev[i] = std::abs(level_adjusts[i] - median);
+        const double mad = median_copy(absdev);
+        const double threshold = (mad > 0.0) ? 15.0 * mad : 0.001;
+        for (double& v : level_adjusts) {
+            if (std::abs(v - median) > threshold) v = median;
+        }
 
-    std::vector<double> level_adjusts = result.wowfactors;
-    const double median = median_copy(level_adjusts);
-    std::vector<double> absdev(level_adjusts.size());
-    for (std::size_t i = 0; i < level_adjusts.size(); ++i) absdev[i] = std::abs(level_adjusts[i] - median);
-    const double mad = median_copy(absdev);
-    const double threshold = (mad > 0.0) ? 15.0 * mad : 0.001;
-    for (double& v : level_adjusts) {
-        if (std::abs(v - median) > threshold) v = median;
-    }
-
-    if (input.wow_level_adjust_smoothing > 0.0) {
-        const double alpha = 1.0 / (input.wow_level_adjust_smoothing * static_cast<double>(input.outlinelen));
-        const double one_minus_alpha = 1.0 - alpha;
-        for (std::size_t i = 1; i < level_adjusts.size(); ++i) {
-            level_adjusts[i] = alpha * level_adjusts[i] + one_minus_alpha * level_adjusts[i - 1U];
+        if (input.wow_level_adjust_smoothing > 0.0) {
+            const double alpha = 1.0 / (input.wow_level_adjust_smoothing * static_cast<double>(input.outlinelen));
+            const double one_minus_alpha = 1.0 - alpha;
+            for (std::size_t i = 1; i < level_adjusts.size(); ++i) {
+                level_adjusts[i] = alpha * level_adjusts[i] + one_minus_alpha * level_adjusts[i - 1U];
+            }
         }
     }
 
     result.dsout_float.assign(static_cast<std::size_t>(outsamples), 0.0f);
     const int lineoffset_out_samples = input.outlinelen * (input.lineoffset + 1);
     const int max_valid = static_cast<int>(input.demod.size()) - 3;
-    for (int i = lineoffset_out_samples; i < outsamples + lineoffset_out_samples; ++i) {
-        const float level_adjust = static_cast<float>(level_adjusts[static_cast<std::size_t>(i)]);
-        const float coord = static_cast<float>(result.interpolated_pixel_locs[static_cast<std::size_t>(i)]);
-        int coord_int = static_cast<int>(coord);
-        coord_int = std::max(1, std::min(coord_int, max_valid));
-        const float p0 = input.demod[static_cast<std::size_t>(coord_int - 1)];
-        const float p1 = input.demod[static_cast<std::size_t>(coord_int)];
-        const float p2 = input.demod[static_cast<std::size_t>(coord_int + 1)];
-        const float p3 = input.demod[static_cast<std::size_t>(coord_int + 2)];
-        const float x = coord - static_cast<float>(coord_int);
-        const float a = p2 - p0;
-        const float b = 2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3;
-        const float c = 3.0f * (p1 - p2) + p3 - p0;
-        result.dsout_float[static_cast<std::size_t>(i - lineoffset_out_samples)] =
-            level_adjust * (p1 + 0.5f * x * (a + x * (b + x * c)));
+    if (input.wow_spline_degree <= 1) {
+        const int max_seg = static_cast<int>(input.linelocs.size()) - 2;
+        for (int seg = input.lineoffset + 1; seg <= max_seg && seg < input.lineoffset + 1 + input.outlinecount; ++seg) {
+            const int start = seg * input.outlinelen;
+            const int end = std::min(outsamples + lineoffset_out_samples, start + input.outlinelen);
+            const double base = input.linelocs[static_cast<std::size_t>(seg)];
+            const double delta =
+                input.linelocs[static_cast<std::size_t>(seg + 1)] - input.linelocs[static_cast<std::size_t>(seg)];
+            for (int i = start; i < end; ++i) {
+                const int within = i - start;
+                const double frac = static_cast<double>(within) / static_cast<double>(input.outlinelen);
+                const float level_adjust = static_cast<float>(level_adjusts[static_cast<std::size_t>(i)]);
+                const float coord = static_cast<float>(base + frac * delta);
+                int coord_int = static_cast<int>(coord);
+                coord_int = std::max(1, std::min(coord_int, max_valid));
+                const float p0 = input.demod[static_cast<std::size_t>(coord_int - 1)];
+                const float p1 = input.demod[static_cast<std::size_t>(coord_int)];
+                const float p2 = input.demod[static_cast<std::size_t>(coord_int + 1)];
+                const float p3 = input.demod[static_cast<std::size_t>(coord_int + 2)];
+                const float x = coord - static_cast<float>(coord_int);
+                const float a = p2 - p0;
+                const float b = 2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3;
+                const float c = 3.0f * (p1 - p2) + p3 - p0;
+                result.dsout_float[static_cast<std::size_t>(i - lineoffset_out_samples)] =
+                    level_adjust * (p1 + 0.5f * x * (a + x * (b + x * c)));
+            }
+        }
+    } else {
+        for (int i = lineoffset_out_samples; i < outsamples + lineoffset_out_samples; ++i) {
+            const float level_adjust = static_cast<float>(level_adjusts[static_cast<std::size_t>(i)]);
+            const float coord = static_cast<float>(interpolated_pixel_locs[static_cast<std::size_t>(i)]);
+            int coord_int = static_cast<int>(coord);
+            coord_int = std::max(1, std::min(coord_int, max_valid));
+            const float p0 = input.demod[static_cast<std::size_t>(coord_int - 1)];
+            const float p1 = input.demod[static_cast<std::size_t>(coord_int)];
+            const float p2 = input.demod[static_cast<std::size_t>(coord_int + 1)];
+            const float p3 = input.demod[static_cast<std::size_t>(coord_int + 2)];
+            const float x = coord - static_cast<float>(coord_int);
+            const float a = p2 - p0;
+            const float b = 2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3;
+            const float c = 3.0f * (p1 - p2) + p3 - p0;
+            result.dsout_float[static_cast<std::size_t>(i - lineoffset_out_samples)] =
+                level_adjust * (p1 + 0.5f * x * (a + x * (b + x * c)));
+        }
     }
 
     if (input.y_comb_limit != 0.0) {
@@ -377,6 +449,12 @@ DownscaleCoreResult downscale_luma(const DownscaleCoreInput& input) {
             input.output_zero,
             input.vsync_ire,
             input.out_scale);
+    }
+    if (input.keep_debug_arrays) {
+        result.wowfactors = std::move(wowfactors);
+        if (!interpolated_pixel_locs.empty()) {
+            result.interpolated_pixel_locs = std::move(interpolated_pixel_locs);
+        }
     }
     return result;
 }

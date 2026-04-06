@@ -1,6 +1,7 @@
 #include "vhsdecode_cpp/resync_runtime.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -28,6 +29,15 @@ double median_or_nan(const std::vector<double>& values) {
         return sorted[mid];
     }
     return 0.5 * (sorted[mid - 1] + sorted[mid]);
+}
+
+void build_pulses_from_raw(const std::vector<int>& starts,
+                           const std::vector<int>& lengths,
+                           std::vector<Pulse>& pulses) {
+    pulses.resize(starts.size());
+    for (std::size_t i = 0; i < starts.size(); ++i) {
+        pulses[i] = Pulse{starts[i], lengths[i]};
+    }
 }
 
 }  // namespace
@@ -153,23 +163,21 @@ void ResyncRuntime::add_pulselevels_to_serration_measures(
         double prev_min_sync = min_sync;
         bool found_candidate = false;
         bool check_next = true;
-        std::vector<int> pulses_starts;
-        std::vector<int> pulses_lengths;
-
         while (retries-- > 0) {
             const auto range = findpulses_range(config_.sysparams_const, min_sync);
-            findpulses_numba_raw_reduced(
+            findpulses_numba_raw_reduced_into(
                 demod_05,
                 range.pulse_hz_max,
                 config_.divisor,
                 static_cast<double>(eq_pulselen_) * 1.0 / 8.0,
                 static_cast<double>(long_pulse_max_),
-                pulses_starts,
-                pulses_lengths);
+                reduced_sync_work_,
+                pulse_starts_work_,
+                pulse_lengths_work_);
 
-            if (pulses_lengths.size() > 200U) {
+            if (pulse_lengths_work_.size() > 200U) {
                 int num_assumed_vsyncs = 0;
-                for (int len : pulses_lengths) {
+                for (int len : pulse_lengths_work_) {
                     if (len > min_vsync_check) {
                         ++num_assumed_vsyncs;
                     }
@@ -177,7 +185,7 @@ void ResyncRuntime::add_pulselevels_to_serration_measures(
 
                 int long_pulses = 0;
                 if (check_long && num_assumed_vsyncs <= 2) {
-                    for (int len : pulses_lengths) {
+                    for (int len : pulse_lengths_work_) {
                         if (inrange(len, long_pulse_min, long_pulse_max)) {
                             ++long_pulses;
                         }
@@ -206,8 +214,8 @@ void ResyncRuntime::add_pulselevels_to_serration_measures(
                             rerange.pulse_hz_max,
                             static_cast<double>(eq_pulselen_) * 1.0 / 8.0,
                             static_cast<double>(long_pulse_max_),
-                            pulses_starts,
-                            pulses_lengths);
+                            pulse_starts_work_,
+                            pulse_lengths_work_);
                         break;
                     } else {
                         check_next = false;
@@ -220,14 +228,10 @@ void ResyncRuntime::add_pulselevels_to_serration_measures(
                 hztoire(config_.sysparams_const, min_sync) + ire_step);
         }
 
-        std::vector<Pulse> pulses;
-        pulses.reserve(pulses_starts.size());
-        for (std::size_t i = 0; i < pulses_starts.size(); ++i) {
-            pulses.push_back(Pulse{pulses_starts[i], pulses_lengths[i]});
-        }
+        build_pulses_from_raw(pulse_starts_work_, pulse_lengths_work_, pulses_work_);
 
         const auto measured =
-            pulses_levels(field, pulses, last_pulse_threshold_, true);
+            pulses_levels(field, pulses_work_, last_pulse_threshold_, true);
         if (std::isnan(measured.first) || std::isnan(measured.second)) {
             return;
         }
@@ -240,12 +244,15 @@ void ResyncRuntime::add_pulselevels_to_serration_measures(
     }
 
     const auto range = findpulses_range(config_.sysparams_const, *sync, *blank);
-    const auto pulses = findpulses_numba(
+    findpulses_numba_raw(
         demod_05,
         range.pulse_hz_max,
         static_cast<double>(eq_pulselen_) * 1.0 / 8.0,
-        static_cast<double>(long_pulse_max_));
-    const auto refreshed = pulses_levels(field, pulses, range.pulse_hz_max, true);
+        static_cast<double>(long_pulse_max_),
+        pulse_starts_work_,
+        pulse_lengths_work_);
+    build_pulses_from_raw(pulse_starts_work_, pulse_lengths_work_, pulses_work_);
+    const auto refreshed = pulses_levels(field, pulses_work_, range.pulse_hz_max, true);
     if (!std::isnan(refreshed.first) && !std::isnan(refreshed.second)) {
         vsync_serration_.push_levels({refreshed.first, refreshed.second});
     }
@@ -259,11 +266,18 @@ std::vector<Pulse> ResyncRuntime::get_pulses_serration(
 
     if (check_levels || !field_state_.has_levels()) {
         if (!(field.color_system == "405" || field.color_system == "819")) {
+            const auto t0 = std::chrono::steady_clock::now();
             vsync_serration_.work(sync_reference);
+            perf_stats_.serration_work_s +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         }
+        const auto t0 = std::chrono::steady_clock::now();
         add_pulselevels_to_serration_measures(field, sync_reference, field.fallback_vsync);
+        perf_stats_.add_pulselevels_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
 
+    const auto t_level_apply_0 = std::chrono::steady_clock::now();
     if (vsync_serration_.has_levels() || field_state_.has_levels()) {
         double sync = std::numeric_limits<double>::quiet_NaN();
         double blank = std::numeric_limits<double>::quiet_NaN();
@@ -313,12 +327,18 @@ std::vector<Pulse> ResyncRuntime::get_pulses_serration(
         }
         last_pulse_threshold_ = range.pulse_hz_max;
     }
+    perf_stats_.level_apply_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_level_apply_0).count();
 
-    return findpulses_numba(
+    const auto t_findpulses_0 = std::chrono::steady_clock::now();
+    auto pulses = findpulses_numba(
         sync_reference,
         last_pulse_threshold_,
         static_cast<double>(eq_pulselen_) * 1.0 / 8.0,
         static_cast<double>(long_pulse_max_));
+    perf_stats_.final_findpulses_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_findpulses_0).count();
+    return pulses;
 }
 
 std::vector<Pulse> ResyncRuntime::get_pulses(ResyncFieldInput& field, bool check_levels) {

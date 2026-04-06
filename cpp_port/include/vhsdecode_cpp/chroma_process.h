@@ -13,6 +13,7 @@ namespace vhsdecode_cpp {
 struct ChromaProcessInput {
     std::vector<double> chroma;
     std::vector<std::vector<double>> chroma_heterodyne;
+    const std::vector<std::vector<double>>* chroma_heterodyne_ref = nullptr;
     std::vector<PhaseSequenceEntry> phase_sequence;
     vhsdecode::cppport::SosFilter fchroma_final;
     std::optional<vhsdecode::cppport::SosFilter> cafc_chroma_bandpass;
@@ -34,6 +35,7 @@ struct ChromaProcessInput {
     bool disable_phase_correction = false;
     bool do_chroma_deemphasis = false;
     bool enable_video_notch = false;
+    bool keep_intermediates = false;
     std::optional<double> burst_phase_avg;
     double burst_abs_ref = 0.0;
 };
@@ -50,6 +52,17 @@ struct ChromaProcessResult {
     std::vector<std::uint16_t> chroma_u16;
     double mean_rms = 0.0;
     std::optional<vhsdecode::cppport::ChromaAfcMeasurement> cafc_measurement;
+    struct PerfStats {
+        double cafc_prefilter_s = 0.0;
+        double burst_deemph_s = 0.0;
+        double upconvert_s = 0.0;
+        double phase_comp_s = 0.0;
+        double final_filter_s = 0.0;
+        double chroma_deemph_s = 0.0;
+        double comb_s = 0.0;
+        double acc_s = 0.0;
+        double to_u16_s = 0.0;
+    } perf;
 };
 
 // Literal-first C++ transliteration of the exercised process_chroma()/decode_chroma
